@@ -4,6 +4,17 @@ from homeassistant.core import callback
 
 from .const import DOMAIN, CONF_EMAIL, CONF_PASSWORD, CONF_GEMINI_API_KEY, VEHICLE_SPECS
 
+CONF_GEMINI_MODEL = "gemini_model"
+
+# Cập nhật danh sách Model AI mới nhất từ Google Gemini (Năm 2026)
+GEMINI_MODELS = {
+    "gemini-2.5-flash": "Gemini 2.5 Flash (Mặc định - Ổn định & Nhanh)",
+    "gemini-2.5-pro": "Gemini 2.5 Pro (Thông minh - Ổn định)",
+    "gemini-3-flash-preview": "Gemini 3 Flash Preview (Tốc độ cao thế hệ mới)",
+    "gemini-3.1-pro-preview": "Gemini 3.1 Pro Preview (Suy luận phức tạp)",
+    "gemini-3.1-flash-lite-preview": "Gemini 3.1 Flash-Lite (Siêu nhẹ, siêu tốc)"
+}
+
 def safe_int(val, default):
     try: return int(float(val))
     except (ValueError, TypeError): return default
@@ -25,7 +36,8 @@ class VinFastConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         data_schema = vol.Schema({
             vol.Required(CONF_EMAIL): str,
             vol.Required(CONF_PASSWORD): str,
-            vol.Optional(CONF_GEMINI_API_KEY, default=""): str, 
+            vol.Optional(CONF_GEMINI_API_KEY, default=""): str,
+            vol.Optional(CONF_GEMINI_MODEL, default="gemini-2.5-flash"): vol.In(GEMINI_MODELS),
         })
         return self.async_show_form(step_id="user", data_schema=data_schema)
 
@@ -62,12 +74,14 @@ class VinFastOptionsFlowHandler(config_entries.OptionsFlow):
         ev_kwh_per_km = safe_float(opts.get("ev_kwh_per_km"), fallback_ev)
         gas_km_per_liter = safe_float(opts.get("gas_km_per_liter"), fallback_gas)
         
-        # LOGIC LẤY KEY: Ưu tiên lấy từ Options (nếu đã từng sửa), nếu không có thì lấy từ lúc setup ban đầu
+        # LOGIC LẤY KEY: Ưu tiên lấy từ Options, nếu không có thì lấy từ lúc setup ban đầu
         current_gemini_key = opts.get(CONF_GEMINI_API_KEY, self._config_entry.data.get(CONF_GEMINI_API_KEY, ""))
+        current_gemini_model = opts.get(CONF_GEMINI_MODEL, self._config_entry.data.get(CONF_GEMINI_MODEL, "gemini-2.5-flash"))
 
         # Form hiển thị khi bấm nút Cấu hình (Options)
         options_schema = vol.Schema({
             vol.Optional(CONF_GEMINI_API_KEY, default=current_gemini_key): str,
+            vol.Optional(CONF_GEMINI_MODEL, default=current_gemini_model): vol.In(GEMINI_MODELS),
             vol.Required("cost_per_kwh", default=cost_per_kwh): vol.Coerce(int),
             vol.Required("ev_kwh_per_km", default=ev_kwh_per_km): vol.Coerce(float),
             vol.Required("gas_price", default=gas_price): vol.Coerce(int),
