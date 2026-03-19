@@ -1,0 +1,548 @@
+import json
+import time
+import datetime
+import logging
+import uuid
+import random
+import math
+import threading
+import paho.mqtt.client as mqtt
+
+from .const import IOT_ENDPOINT, WWW_DIR, MOCK_FILE
+from .api_helpers import get_address_from_osm, get_weather_data, get_osrm_route, get_ai_advice, safe_float
+
+_LOGGER = logging.getLogger(__name__)
+
+class MQTTManager:
+    def __init__(self, core):
+        self.core = core
+        self.client = None
+        self._needs_mqtt_renew = False 
+        self._mqtt_client_id_rand = "".join(random.choice("0123456789qwertyuiop") for _ in range(15))
+
+    def start(self):
+        self.core._running = True
+        threading.Thread(target=self._api_polling_loop, daemon=True).start()
+        threading.Thread(target=self.core.auth.fetch_charging_history, daemon=True).start()
+
+    def stop(self):
+        if self.client:
+            self.client.loop_stop()
+            try: self.client.disconnect()
+            except: pass
+
+    def _renew_aws_connection(self):
+        try:
+            if self.client:
+                self.client.loop_stop()
+                try: self.client.disconnect()
+                except: pass
+                self.client = None 
+                
+            self.client = mqtt.Client(client_id=f"Android_{self.core.vin}_{self._mqtt_client_id_rand}", transport="websockets")
+            self.client.on_connect = self._on_connect
+            self.client.on_disconnect = self._on_disconnect
+            self.client.on_message = self._on_message
+            self.client.tls_set()
+            
+            self.core.auth.login()
+            self.core.auth.register_device_trust()
+            new_url = self.core.auth.get_aws_mqtt_url()
+            if new_url:
+                self.client.ws_set_options(path=new_url.split(IOT_ENDPOINT)[1])
+                self.client.connect(IOT_ENDPOINT, 443, 30)
+                self.client.loop_start()
+                self._needs_mqtt_renew = False 
+        except Exception as e: pass
+
+    def _on_connect(self, client, userdata, flags, rc, properties=None):
+        if rc == 0: 
+            client.subscribe(f"/mobile/{self.core.vin}/push", qos=1)
+            client.subscribe(f"monitoring/server/{self.core.vin}/push", qos=1)
+            client.subscribe(f"/server/{self.core.vin}/remctrl", qos=1)
+            self.core._last_mqtt_msg_time = time.time()
+
+    def _on_disconnect(self, client, userdata, rc):
+        self._needs_mqtt_renew = True
+
+    def _send_heartbeat(self, state="1"):
+        if not self.client or not self.client.is_connected() or not self.core.vin: return
+        topic = f"/vehicles/{self.core.vin}/push/connected/heartbeat"
+        payload = {"version": "1.2", "timestamp": int(time.time() * 1000), "trans_id": str(uuid.uuid4()), "content": {"34183": { "1": { "54": str(state) } }}}
+        try: self.client.publish(topic, json.dumps(payload), qos=1)
+        except Exception: pass
+
+    def _api_polling_loop(self):
+        time.sleep(5) 
+        if not self.core.user_id: self.core.auth.get_vehicles()
+        self._renew_aws_connection()
+        self.core.auth.register_resources()
+        
+        last_heartbeat = time.time()
+        last_state_save = time.time()
+        last_aws_renew = time.time()
+        
+        while self.core._running:
+            try:
+                time.sleep(1)
+                now = time.time()
+                core = self.core
+
+                if now - last_heartbeat >= 60:
+                    last_heartbeat = now
+                    state = "2" if getattr(core, '_is_moving', False) else "1"
+                    self._send_heartbeat(state)
+
+                if now - last_aws_renew >= 3000 or self._needs_mqtt_renew:
+                    last_aws_renew = now
+                    self._renew_aws_connection()
+
+                time_since_last_msg = now - getattr(core, '_last_mqtt_msg_time', now)
+                if getattr(core, '_is_moving', False) and time_since_last_msg > 180:
+                    self._needs_mqtt_renew = True
+                    core._last_mqtt_msg_time = now 
+
+                if getattr(core, '_vehicle_offline', False):
+                    time_since_last_wakeup = now - getattr(core, '_last_auto_wakeup_time', 0)
+                    if time_since_last_wakeup > 180:
+                        core.auth.register_resources() 
+
+                time_since_move = now - getattr(core, '_last_actual_move_time', now)
+                if getattr(core, '_is_trip_active', False) and not getattr(core, '_is_moving', False) and time_since_move >= 300:
+                    core._is_trip_active = False 
+                    core._save_trip_history()
+                    
+                    trip_dist = float(core._last_data.get("api_trip_distance", 0))
+                    soc_start = getattr(core, '_trip_start_soc', 100.0)
+                    soc_end = safe_float(core._last_data.get("34183_00001_00009", core._last_data.get("34180_00001_00011", 50)))
+                    soc_drop = soc_start - soc_end
+                    
+                    if trip_dist >= 0.5: 
+                        trip_data = {"dist": trip_dist, "drop": soc_drop}
+                        threading.Thread(target=self._run_ai_advisor_wrapper, args=("trip", trip_data), daemon=True).start()
+                        
+                    core._trip_start_odo = 0.0
+                    core._trip_start_time = time.time()
+                    core._route_coords = []
+                    core._trip_accumulated_distance_m = 0.0 
+                    core._save_state() 
+
+                if now - last_state_save >= 60:
+                    last_state_save = now
+                    core._save_state()
+            except Exception: pass
+
+    def _update_location_async(self, lat, lon):
+        try:
+            core = self.core
+            grid_coord = f"{round(float(lat), 3)},{round(float(lon), 3)}"
+            curr_addr = core._last_data.get("api_current_address", "")
+            
+            def fetch_weather():
+                now = time.time()
+                if now - getattr(core, '_last_weather_fetch_time', 0) < 900: return
+                w_data = get_weather_data(lat, lon)
+                if w_data:
+                    core._last_weather_fetch_time = now
+                    core._last_data["api_outside_temp"] = w_data["temp"]
+                    core._last_data["api_weather_condition"] = w_data["condition"]
+                    core._last_data["api_hvac_load_estimate"] = w_data["hvac"]
+                    if now - getattr(core, '_last_ai_weather_time', 0) > 1800 and (w_data["temp"] >= 38 or w_data["temp"] <= 15 or w_data["code"] in [80, 81, 82, 95, 96, 99]):
+                        core._last_ai_weather_time = now
+                        threading.Thread(target=self._run_ai_advisor_wrapper, args=("weather", {"temp": w_data["temp"], "cond": w_data["condition"]}), daemon=True).start()
+                    core._save_state()
+                    core.trigger_callbacks()
+                    
+            threading.Thread(target=fetch_weather, daemon=True).start()
+            
+            with core._geocode_lock:
+                if getattr(core, '_last_geocoded_grid', None) != grid_coord or "Tọa độ" in curr_addr or "Đang kết nối" in curr_addr:
+                    addr = get_address_from_osm(lat, lon)
+                    if addr:
+                        core._last_data["api_current_address"] = addr
+                        core._last_geocoded_grid = grid_coord 
+                        threading.Thread(target=core.auth.fetch_nearby_stations, daemon=True).start()
+                    else:
+                        core._last_data["api_current_address"] = f"Tọa độ: {lat:.5f}, {lon:.5f}"
+                    core._save_state()
+                    core.trigger_callbacks()
+        except Exception: pass
+
+    def _run_ai_advisor_wrapper(self, mode="trip", data_payload=None):
+        core = self.core
+        try:
+            if not getattr(core, 'gemini_api_key', None) or core.gemini_api_key.strip() == "":
+                core._last_data["api_ai_advisor"] = "Vui lòng nhập Google Gemini API Key để AI đánh giá."
+                core.trigger_callbacks()
+                return 
+
+            std_range = safe_float(core._last_data.get("api_static_range", 210))
+            expected_km_per_1 = round(std_range / 100.0, 2) if std_range > 0 else 2.1
+            
+            context_data = {
+                "temp": core._last_data.get("api_outside_temp", "Không rõ"),
+                "cond": core._last_data.get("api_weather_condition", "Không rõ"),
+                "hvac": core._last_data.get("api_hvac_load_estimate", "Bình thường"),
+                "expected_km_per_1": expected_km_per_1,
+                "trip_dist": float(core._last_data.get("api_trip_distance", 0.0)),
+                "trip_avg_speed": core._last_data.get("api_trip_avg_speed", 0)
+            }
+            
+            ai_model = core.options.get("gemini_model", core.options.get("CONF_GEMINI_MODEL", "gemini-2.5-flash"))
+            
+            if mode == "weather":
+                core._last_data["api_ai_advisor"] = f"☁️ Thời tiết khắc nghiệt ({context_data['temp']}°C). Đang gọi AI tư vấn..."
+            elif mode == "anomaly":
+                dist = round(data_payload.get('dist', 0), 2) if data_payload else 0
+                core._last_data["api_ai_advisor"] = f"⚠️ Sụt pin nhanh! (1% đi được {dist}km). Đang chờ AI phân tích..."
+            else:
+                core._last_data["api_ai_advisor"] = "🔄 Đang tổng kết chuyến đi. Gửi dữ liệu cho AI phân tích..."
+                
+            core.trigger_callbacks()
+                
+            result = get_ai_advice(core.gemini_api_key, ai_model, mode, data_payload, context_data)
+            
+            core._last_data["api_ai_advisor"] = result
+            core._save_state()
+            core.trigger_callbacks()
+        except Exception: pass
+
+    def _filter_critical_data(self, key, current_val, fallback_val):
+        if current_val is None or str(current_val).strip().upper() in ["NONE", "NULL", "UNKNOWN", ""]:
+            return fallback_val
+        try:
+            c_val_float = float(current_val)
+            f_val_float = float(fallback_val) if fallback_val is not None else 0.0
+            
+            no_zero_keys = [
+                "34183_00001_00009", "34180_00001_00011", "34183_00001_00011", "34180_00001_00007", 
+                "34193_00001_00012", "34193_00001_00014", "34193_00001_00019", "34220_00001_00001", 
+                "34183_00001_00005", "00006_00001_00000", "00006_00001_00001"  
+            ]
+            if key in no_zero_keys and c_val_float <= 0.0001 and f_val_float > 0:
+                return fallback_val
+
+            odo_keys = ["34183_00001_00003", "34199_00000_00000"]
+            if key in odo_keys and c_val_float < f_val_float:
+                return fallback_val
+        except Exception: pass
+        return current_val
+
+    def _on_message(self, client, userdata, msg):
+        core = self.core
+        current_time = time.time()
+        core._last_mqtt_msg_time = current_time 
+        
+        try:
+            payload = json.loads(msg.payload.decode('utf-8'))
+            data_dict = {}
+            items = []
+            if isinstance(payload, list): items = payload
+            elif isinstance(payload, dict):
+                if "data" in payload and isinstance(payload["data"], list): items = payload["data"]
+                elif "content" in payload and isinstance(payload["content"], list): items = payload["content"]
+            
+            time_str = datetime.datetime.now().strftime("%H:%M:%S")
+            
+            for item in items:
+                if not isinstance(item, dict): continue
+                obj, inst, res = str(item.get("objectId", "0")).zfill(5), str(item.get("instanceId", "0")).zfill(5), str(item.get("resourceId", "0")).zfill(5)
+                key = item.get("deviceKey") if "deviceKey" in item else f"{obj}_{inst}_{res}"
+                val = item.get("value")
+                
+                if key and val is not None:
+                    str_val = str(val).strip()
+                    old_val = str(core._last_data.get(key, "N/A"))
+                    if old_val != str_val:
+                        core._raw_json_dict[key] = str_val
+                        core._changelog_buffer.insert(0, {"time": time_str, "code": key, "old_value": old_val, "new_value": str_val})
+                
+                if key == "56789_00001_00007":
+                    if str(val) == "CONNECTION_LOST": core._vehicle_offline = True
+                    elif str(val) == "NONE": core._vehicle_offline = False
+                
+                if key == "34180_00001_00011" and isinstance(val, str) and "profile_email" in val: continue 
+                
+                if key and val is not None: 
+                    data_dict[key] = self._filter_critical_data(key, val, core._last_data.get(key))
+            
+            if not data_dict: return
+            
+            t1 = data_dict.get("34193_00001_00012")
+            t2 = data_dict.get("34193_00001_00014")
+            t3 = data_dict.get("34193_00001_00019")
+            target_val = t1 if t1 is not None else (t2 if t2 is not None else t3)
+            if target_val is not None:
+                try:
+                    if float(target_val) > 0: core._last_data["api_target_charge_limit"] = float(target_val)
+                except: pass
+
+            core._last_data.update(data_dict)
+            core._last_data["api_debug_raw"] = f"Nhận: {len(data_dict)} mã ({time_str})"
+            
+            for k in ["34180_00001_00010", "34183_00001_00010", "34181_00001_00007"]:
+                if k in data_dict and isinstance(data_dict[k], str):
+                    core._update_vehicle_name(data_dict[k])
+                
+        except Exception: return
+
+        current_soc = safe_float(core._last_data.get("34183_00001_00009", core._last_data.get("34180_00001_00011", 0)))
+        
+        try:
+            model = getattr(core, "vehicle_model_display", "Unknown").upper()
+            if "VF8" in model or "VF9" in model:
+                gear = str(core._last_data.get("34187_00000_00000", "1"))
+                speed = safe_float(core._last_data.get("34188_00000_00000", 0))
+            else: 
+                gear = str(core._last_data.get("34183_00001_00001", "1"))
+                speed = safe_float(core._last_data.get("34183_00001_00002", 0))
+
+            if speed > 0 or gear in ["2", "4", "D", "R"]:
+                core._is_moving = True
+                core._last_actual_move_time = current_time
+                base_status = "Đang di chuyển"
+            else:
+                core._is_moving = False
+                base_status = "Đang đỗ" if gear == "1" else "Đang dừng"
+
+            if core._is_moving and not getattr(core, '_is_trip_active', False):
+                core._trip_start_time = current_time
+                core._trip_start_soc = current_soc
+                core._is_trip_active = True
+                core._last_data["api_trip_distance"] = 0.0
+                core._last_data["api_trip_efficiency"] = 0.0
+                core._trip_accumulated_distance_m = 0.0 
+                core._route_coords = [] 
+                core._save_state()
+        except Exception: pass
+
+        try:
+            lat = safe_float(core._last_data.get("00006_00001_00000"))
+            lon = safe_float(core._last_data.get("00006_00001_00001"))
+            
+            if lat > 0 and lon > 0:
+                curr_coord = f"{lat},{lon}"
+                if curr_coord != getattr(core, '_last_lat_lon', ""): 
+                    core._last_lat_lon = curr_coord
+                    threading.Thread(target=self._update_location_async, args=(lat, lon), daemon=True).start()
+                    
+                    if getattr(core, '_is_trip_active', False):
+                        actual_speed_kmh = float(speed)
+                        if not core._route_coords:
+                            core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
+                            core._last_gps_time = current_time
+                        else:
+                            last_lat = core._route_coords[-1][0]
+                            last_lon = core._route_coords[-1][1]
+                            
+                            R = 6371000 
+                            phi1 = math.radians(last_lat)
+                            phi2 = math.radians(lat)
+                            dphi = math.radians(lat - last_lat)
+                            dlambda = math.radians(lon - last_lon)
+                            a = math.sin(dphi/2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda/2)**2
+                            distance_m = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+                            
+                            time_diff = current_time - core._last_gps_time
+                            if time_diff <= 0: time_diff = 1 
+                            
+                            implied_speed_kmh = (distance_m / time_diff) * 3.6
+                            dynamic_threshold_m = max(5.0, (actual_speed_kmh * 1000 / 3600)) 
+                            max_allowed_speed = max(120.0, actual_speed_kmh + 50.0)
+
+                            is_valid_point = True
+                            if actual_speed_kmh == 0 and distance_m > 15.0: is_valid_point = False
+                            elif implied_speed_kmh > max_allowed_speed: is_valid_point = False
+
+                            if is_valid_point:
+                                if 200 <= distance_m <= 10000:
+                                    osrm_coords = get_osrm_route(last_lat, last_lon, lat, lon)
+                                    if osrm_coords and len(osrm_coords) > 2:
+                                        osrm_coords = osrm_coords[1:]
+                                        avg_speed = int((actual_speed_kmh + core._route_coords[-1][2]) / 2)
+                                        if avg_speed == 0: avg_speed = 30
+                                        for p in osrm_coords:
+                                            core._route_coords.append([round(p[0], 6), round(p[1], 6), avg_speed])
+                                            core._trip_accumulated_distance_m += distance_m / len(osrm_coords)
+                                            core._eff_gps_dist += distance_m / len(osrm_coords)
+                                    else:
+                                        core._trip_accumulated_distance_m += distance_m
+                                        core._eff_gps_dist += distance_m
+                                        core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
+                                else:
+                                    if distance_m >= dynamic_threshold_m:
+                                        core._trip_accumulated_distance_m += distance_m
+                                        core._eff_gps_dist += distance_m
+                                        core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
+                                        
+                                if len(core._route_coords) > 1500: core._route_coords.pop(0) 
+                                core._last_data["api_trip_route"] = json.dumps(core._route_coords)
+                                core._last_gps_time = current_time
+                                
+            if getattr(core, '_is_trip_active', False):
+                final_trip_dist = core._trip_accumulated_distance_m / 1000.0
+                core._last_data["api_trip_distance"] = round(final_trip_dist, 2)
+
+                if final_trip_dist > 0:
+                    trip_hrs = (current_time - getattr(core, '_trip_start_time', current_time)) / 3600.0
+                    if trip_hrs > 0:
+                        core._last_data["api_trip_avg_speed"] = round(final_trip_dist / trip_hrs, 1)
+
+                    if getattr(core, '_trip_start_soc', 0) > current_soc:
+                        cap = safe_float(core._last_data.get("api_static_capacity", 0))
+                        if cap > 0:
+                            energy_used = ((core._trip_start_soc - current_soc) / 100.0) * cap
+                            core._last_data["api_trip_energy_used"] = round(energy_used, 2)
+                            core._last_data["api_trip_efficiency"] = round((energy_used / final_trip_dist) * 100, 2)
+
+        except Exception as e: pass
+
+        if current_soc > 0:
+            if getattr(core, '_eff_soc', None) is None or current_soc > core._eff_soc:
+                core._eff_soc = current_soc
+                core._eff_gps_dist = 0.0
+                core._eff_time = current_time 
+                core._eff_speeds = []
+            
+            if speed > 0: core._eff_speeds.append(speed)
+                
+            if current_soc < core._eff_soc:
+                drop_amount = core._eff_soc - current_soc
+                dist_km = getattr(core, '_eff_gps_dist', 0.0) / 1000.0
+                if dist_km > 0:
+                    sorted_speeds = sorted(core._eff_speeds)
+                    median_speed = sorted_speeds[len(sorted_speeds) // 2] if sorted_speeds else speed
+                    band_lower = int(median_speed / 10) * 10
+                    band_key = f"{band_lower}-{band_lower+10}"
+                    
+                    if band_key not in core._eff_stats: core._eff_stats[band_key] = {"dist": 0.0, "drops": 0.0}
+                    core._eff_stats[band_key]["dist"] += dist_km
+                    core._eff_stats[band_key]["drops"] += drop_amount
+                    
+                    best_b, max_e = "Đang thu thập", 0
+                    for k, v in core._eff_stats.items():
+                        if v["drops"] > 0:
+                            eff = v["dist"] / v["drops"]
+                            if eff > max_e: max_e, best_b = eff, k
+                    if max_e > 0: core._last_data["api_best_efficiency_band"] = f"{best_b} km/h ({round(max_e, 2)} km/1%)"
+
+                    max_range = safe_float(core._last_data.get("api_static_range", 0))
+                    if max_range > 0 and drop_amount >= 1.0:
+                        expected_dist_per_1 = max_range / 100.0
+                        if dist_km < (expected_dist_per_1 * 0.70):
+                            now = time.time()
+                            if now - getattr(core, '_last_ai_anomaly_time', 0) > 900:
+                                core._last_ai_anomaly_time = now
+                                start_t = getattr(core, '_eff_time', None) or (now - 60)
+                                time_taken_hrs = (now - start_t) / 3600.0
+                                actual_spd = dist_km / time_taken_hrs if time_taken_hrs > 0 else median_speed
+                                threading.Thread(target=self._run_ai_advisor_wrapper, args=("anomaly", {"dist": dist_km, "drop": drop_amount, "expected": expected_dist_per_1, "speed": actual_spd}), daemon=True).start()
+                
+                core._eff_soc = current_soc
+                core._eff_gps_dist = 0.0
+                core._eff_time = current_time
+                core._eff_speeds = []
+
+        try:
+            if "VF8" in model or "VF9" in model: c_status = str(core._last_data.get("34183_00000_00001", "0"))
+            else: c_status = str(core._last_data.get("34193_00001_00005", "0"))
+
+            is_charging = (c_status == "1")
+            is_fully_charged = False 
+
+            if c_status in ["0", "2", "3", "4"] or getattr(core, '_is_moving', False):
+                is_charging = False
+                is_fully_charged = False
+
+            t_limit = safe_float(core._last_data.get("api_target_charge_limit", 100))
+            if t_limit > 0 and current_soc >= t_limit and (is_charging or c_status in ["2", "3"]):
+                is_fully_charged = True
+                is_charging = False
+
+            core._is_charging = is_charging
+
+            if is_charging: core._last_data["api_vehicle_status"] = "Đang sạc"
+            elif is_fully_charged: core._last_data["api_vehicle_status"] = "Đã sạc xong"
+            else: core._last_data["api_vehicle_status"] = base_status
+
+        except Exception as e: pass
+
+        try:
+            if core._is_charging and not getattr(core, '_last_is_charging', False):
+                core._current_charge_max_power = 0.0
+                if current_soc > 0:
+                    core._last_data["api_last_charge_start_soc"] = current_soc
+                    core._last_data["api_last_charge_end_soc"] = current_soc 
+                    core._charge_start_soc = current_soc
+                else:
+                    core._charge_start_soc = safe_float(core._last_data.get("api_last_charge_start_soc", 0))
+
+                core._charge_calc_soc = core._charge_start_soc
+                core._charge_start_time = current_time
+                core._charge_calc_time = current_time
+                core._last_data["api_live_charge_power"] = 0.0
+                core._last_is_charging = True
+                core._save_state() 
+                
+            elif core._is_charging and getattr(core, '_last_is_charging', False):
+                if current_soc > 0 and current_soc >= core._charge_start_soc:
+                    core._last_data["api_last_charge_end_soc"] = current_soc
+
+                if getattr(core, '_charge_calc_soc', 0.0) == 0.0 and current_soc > 0:
+                    core._charge_calc_soc = current_soc
+                    core._charge_calc_time = current_time
+                    core._last_data["api_live_charge_power"] = 0.0
+                elif current_soc > core._charge_calc_soc and current_soc > 0:
+                    delta_soc = current_soc - core._charge_calc_soc
+                    delta_time_hrs = (current_time - core._charge_calc_time) / 3600.0
+                    cap = safe_float(core._last_data.get("api_static_capacity", 18.64))
+                    if cap == 0: cap = 18.64
+                    
+                    if getattr(core, '_charge_calc_soc', 0.0) != getattr(core, '_charge_start_soc', 0.0):
+                        if delta_time_hrs > 0 and cap > 0:
+                            power = (delta_soc / 100.0) * cap / delta_time_hrs
+                            if 0 < power < 360: 
+                                core._last_data["api_live_charge_power"] = round(power, 1)
+                                core._current_charge_max_power = max(getattr(core, '_current_charge_max_power', 0.0), power)
+                                
+                    core._charge_calc_soc = current_soc
+                    core._charge_calc_time = current_time
+                    core._save_state()
+                elif current_time - getattr(core, '_charge_calc_time', current_time) > 900:
+                    core._last_data["api_live_charge_power"] = 0.0
+                    
+            elif not core._is_charging and getattr(core, '_last_is_charging', False):
+                if current_soc > 0 and current_soc >= getattr(core, '_charge_start_soc', 0):
+                    core._last_data["api_last_charge_end_soc"] = current_soc
+                    
+                delta_soc = safe_float(core._last_data.get("api_last_charge_end_soc", current_soc)) - getattr(core, '_charge_start_soc', 0)
+                if delta_soc > 1.0 and current_soc > 0: 
+                    cap = safe_float(core._last_data.get("api_static_capacity", 18.64))
+                    if cap == 0: cap = 18.64
+                    added_kwh = (delta_soc / 100.0) * cap
+                    
+                    is_home_charge = True
+                    try:
+                        stations = json.loads(core._last_data.get("api_nearby_stations", "[]"))
+                        if stations and len(stations) > 0 and float(stations[0].get("dist", 999)) < 0.5: is_home_charge = False 
+                    except: pass
+                        
+                    if is_home_charge or getattr(core, '_current_charge_max_power', 0.0) < 15.0:
+                        core._last_data["api_home_charge_sessions"] = int(core._last_data.get("api_home_charge_sessions", 0)) + 1
+                        core._last_data["api_home_charge_kwh"] = round(float(core._last_data.get("api_home_charge_kwh", 0.0)) + added_kwh, 2)
+                
+                threading.Thread(target=core.auth.fetch_charging_history, daemon=True).start()
+                
+                if getattr(core, '_charge_start_time', 0) > 0:
+                    core._last_data["api_last_charge_duration"] = round((current_time - core._charge_start_time) / 60.0, 0)
+                
+                core._last_is_charging = False
+                core._charge_calc_soc = 0.0
+                core._charge_calc_time = current_time
+                core._last_data["api_live_charge_power"] = 0.0
+                core._current_charge_max_power = 0.0 
+                core._save_state() 
+
+        except Exception: pass
+
+        core.trigger_callbacks()
