@@ -1,6 +1,6 @@
 {
   "domain": "vinfast",
-  "name": "VinFast Car",
+  "name": "VinFast Connected Car",
   "codeowners": ["@thangnd85"],
   "config_flow": true,
   "dependencies": [],
