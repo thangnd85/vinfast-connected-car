@@ -90,7 +90,8 @@ class VinFastSensor(SensorEntity):
                 elif val_clean in ["0", "3", "4"]: self._attr_native_value = "Không Sạc" if vi else "Not Charging"
                 else: self._attr_native_value = val
 
-            elif self._device_key == "34213_00001_00003":
+            # --- SỬA LẠI NHÓM KHÓA CỬA CHO VF6 ---
+            elif self._device_key in ["34213_00001_00003", "34206_00001_00001"]:
                 if val_clean == "1": self._attr_native_value = "Đã Khóa" if vi else "Locked"
                 elif val_clean == "0": self._attr_native_value = "Mở Khóa" if vi else "Unlocked"
                 else: self._attr_native_value = val
@@ -100,7 +101,8 @@ class VinFastSensor(SensorEntity):
                 elif val_clean == "0": self._attr_native_value = "Đã Tắt An Ninh" if vi else "Disarmed"
                 else: self._attr_native_value = val
 
-            elif self._device_key in ["34205_00001_00001", "34206_00001_00001", "34207_00001_00001", "34186_00005_00004"]:
+            # --- XÓA 34206 KHỎI ĐÂY (VÌ NÓ ĐÃ THÀNH KHÓA CỬA TRÊN VF6) ---
+            elif self._device_key in ["34205_00001_00001", "34207_00001_00001", "34186_00005_00004"]:
                 if val_clean == "1": self._attr_native_value = "Đang Bật" if vi else "On"
                 elif val_clean == "0": self._attr_native_value = "Đã Tắt" if vi else "Off"
                 else: self._attr_native_value = val
@@ -139,9 +141,10 @@ class VinFastSensor(SensorEntity):
                 elif val_clean == "1": self._attr_native_value = "Bật sấy kính lái" if vi else "Defrost On"
                 else: self._attr_native_value = val
 
-            elif self._device_key == "34213_00004_00003":
-                if val_clean == "0": self._attr_native_value = "Tắt nháy" if vi else "Off"
-                elif val_clean == "1": self._attr_native_value = "Đang nháy pha" if vi else "Flashing"
+            # --- THÊM XỬ LÝ CHO ĐÈN PHA ---
+            elif self._device_key in ["34213_00004_00003", "56789_00001_00005"]:
+                if val_clean == "0": self._attr_native_value = "Tắt" if vi else "Off"
+                elif val_clean == "1": self._attr_native_value = "Bật" if vi else "On"
                 else: self._attr_native_value = val
 
             elif self._device_key in ["34184_00001_00025", "34184_00001_00041"]:
@@ -198,7 +201,6 @@ class VinFastSensor(SensorEntity):
                 self._attr_extra_state_attributes = {"full_text": val_str}
                 self._attr_native_value = val_str[:250] + "..." if len(val_str) > 250 else val_str
 
-            # BẢN VÁ: Gộp chính xác Số lần sạc để miễn nhiễm lỗi restart
             elif self._device_key == "api_total_charge_sessions":
                 try:
                     pub = int(float(self.api._last_data.get("api_public_charge_sessions", 0)))
@@ -211,7 +213,6 @@ class VinFastSensor(SensorEntity):
                 except Exception:
                     self._attr_native_value = val
 
-            # BẢN VÁ: Đổ toàn bộ Dictionary vào Attribute để HA kẻ bảng hiển thị
             elif self._device_key == "api_debug_raw":
                 try:
                     raw_dict = getattr(self.api, '_raw_json_dict', {})

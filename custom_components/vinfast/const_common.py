@@ -20,6 +20,7 @@ VIRTUAL_SENSORS = {
     "api_last_charge_end_soc": ("% Pin lúc rút sạc (Lần cuối)", "%", "mdi:battery-arrow-up", "battery"),
     "api_last_charge_duration": ("Thời gian cắm sạc (Lần cuối)", "min", "mdi:timer-sand", "duration"),
     "api_last_charge_energy": ("Điện năng lấy từ lưới (Lần cuối)", "kWh", "mdi:flash", "energy"),
+    "api_last_charge_efficiency": ("Hiệu suất sạc thực tế (Lần cuối)", "%", "mdi:car-electric-outline", None),
     "api_last_charge_power": ("Công suất sạc trung bình (Lần cuối)", "kW", "mdi:ev-plug-type2", "power"),
     "api_live_charge_power": ("Công suất sạc tính toán (Live)", "kW", "mdi:flash", "power"),
     "api_total_charge_cost_est": ("Tổng chi phí sạc quy đổi", "VNĐ", "mdi:cash-fast", "monetary"),
@@ -117,8 +118,13 @@ PLATFORM_A_BASE.update({
 })
 
 # BỘ MÃ CHUYÊN BIỆT CHO NỀN TẢNG A (VF5, VF6, VF7, VF e34)
+# Ghi đè lại Khóa cửa và thêm Đèn Pha cho VF6
 PLATFORM_VF567_SENSORS = PLATFORM_A_BASE.copy()
 PLATFORM_VF567_SENSORS.update(REAR_DOORS_WINDOWS)
+PLATFORM_VF567_SENSORS.update({
+    "56789_00001_00005": ("Trạng thái Đèn Pha", None, "mdi:car-light-high", None),
+    "34206_00001_00001": ("Khóa tổng", None, "mdi:lock", None), # Override từ Camp mode thành Khóa cửa
+})
 
 # PLATFORM B BASE (VF8, VF9)
 PLATFORM_B_BASE = COMMON_SENSORS.copy()

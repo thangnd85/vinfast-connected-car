@@ -519,7 +519,7 @@ class MQTTManager:
                     if cap == 0: cap = 18.64
                     added_kwh = (delta_soc / 100.0) * cap
                     
-                    # --- BẢN VÁ: TÍNH ĐIỆN NĂNG LƯỚI & HIỆU SUẤT SẠC AC MẶC ĐỊNH ---
+                    # --- MẶC ĐỊNH SẠC NHÀ = 92% HIỆU SUẤT ---
                     core._last_data["api_last_charge_energy"] = round(added_kwh / 0.92, 2)
                     core._last_data["api_last_charge_efficiency"] = 92.0
                     
@@ -547,6 +547,16 @@ class MQTTManager:
                             
                             if new_pub > prev_pub:
                                 api_success = True
+                                # --- TÍNH TOÁN HIỆU SUẤT THỰC TẾ TỪ LỊCH SỬ TRẠM SẠC ---
+                                try:
+                                    history_list = json.loads(new_history)
+                                    if history_list and len(history_list) > 0:
+                                        rest_kwh = float(history_list[0].get("kwh", 0.0))
+                                        if rest_kwh > 0.0:
+                                            eff = (added_kwh / rest_kwh) * 100.0
+                                            core._last_data["api_last_charge_energy"] = round(rest_kwh, 2)
+                                            core._last_data["api_last_charge_efficiency"] = round(min(eff, 100.0), 1)
+                                except Exception: pass
                                 break
                             if new_history == prev_history and prev_history != "[]" and is_home_charge and max_pwr <= 11.0:
                                 break
