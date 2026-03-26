@@ -41,6 +41,7 @@ VIRTUAL_SENSORS = {
     "api_vehicle_image": ("Hình ảnh xe URL", None, "mdi:image", None),
     "api_trip_route": ("Lộ trình GPS", None, "mdi:map-marker-path", None),
     "api_nearby_stations": ("Trạm sạc lân cận", None, "mdi:ev-station", None),
+    "api_security_warning": ("Cảnh báo An ninh", None, "mdi:shield-alert", None),
     "api_debug_raw": ("System Debug Raw", None, "mdi:bug", None)
 }
 
@@ -118,12 +119,16 @@ PLATFORM_A_BASE.update({
 })
 
 # BỘ MÃ CHUYÊN BIỆT CHO NỀN TẢNG A (VF5, VF6, VF7, VF e34)
-# Ghi đè lại Khóa cửa và thêm Đèn Pha cho VF6
 PLATFORM_VF567_SENSORS = PLATFORM_A_BASE.copy()
 PLATFORM_VF567_SENSORS.update(REAR_DOORS_WINDOWS)
+
+# Fix lỗi 2 cảm biến Khóa cửa cùng tồn tại trên VF6
+if "34213_00001_00003" in PLATFORM_VF567_SENSORS:
+    del PLATFORM_VF567_SENSORS["34213_00001_00003"]
+
 PLATFORM_VF567_SENSORS.update({
     "56789_00001_00005": ("Trạng thái Đèn Pha", None, "mdi:car-light-high", None),
-    "34206_00001_00001": ("Khóa tổng", None, "mdi:lock", None), # Override từ Camp mode thành Khóa cửa
+    "34206_00001_00001": ("Khóa tổng", None, "mdi:lock", None), 
 })
 
 # PLATFORM B BASE (VF8, VF9)

@@ -519,7 +519,6 @@ class MQTTManager:
                     if cap == 0: cap = 18.64
                     added_kwh = (delta_soc / 100.0) * cap
                     
-                    # --- MẶC ĐỊNH SẠC NHÀ = 92% HIỆU SUẤT ---
                     core._last_data["api_last_charge_energy"] = round(added_kwh / 0.92, 2)
                     core._last_data["api_last_charge_efficiency"] = 92.0
                     
@@ -547,7 +546,6 @@ class MQTTManager:
                             
                             if new_pub > prev_pub:
                                 api_success = True
-                                # --- TÍNH TOÁN HIỆU SUẤT THỰC TẾ TỪ LỊCH SỬ TRẠM SẠC ---
                                 try:
                                     history_list = json.loads(new_history)
                                     if history_list and len(history_list) > 0:
@@ -579,5 +577,53 @@ class MQTTManager:
                 core._save_state() 
 
         except Exception: pass
+
+        # =====================================================================
+        # THUẬT TOÁN TỔNG HỢP CẢNH BÁO AN NINH (Theo Model xe)
+        # =====================================================================
+        try:
+            open_doors = []
+            
+            door_map = {
+                "10351_00002_00050": "Cửa lái", "10351_00001_00050": "Cửa phụ",
+                "10351_00004_00050": "Cửa sau T", "10351_00003_00050": "Cửa sau P",
+                "10351_00006_00050": "Cốp", "10351_00005_00050": "Capo"
+            }
+            for dk, dname in door_map.items():
+                if str(core._last_data.get(dk, "0")) == "1": open_doors.append(dname)
+                
+            window_map = {
+                "34215_00002_00002": "Kính lái", "34215_00001_00002": "Kính phụ",
+                "34215_00004_00002": "Kính sau T", "34215_00003_00002": "Kính sau P"
+            }
+            for wk, wname in window_map.items():
+                if str(core._last_data.get(wk, "0")) == "2": open_doors.append(wname)
+            
+            model_name = getattr(core, "vehicle_model_display", "Unknown").upper()
+            
+            lock_1 = str(core._last_data.get("34213_00001_00003", "1"))
+            is_unlocked = (lock_1 == "0")
+            
+            # VF5, 6, 7, e34 dùng mã 34206 làm Khóa cửa phụ
+            if "VF5" in model_name or "VF 5" in model_name or "VF6" in model_name or "VF 6" in model_name or "VF7" in model_name or "VF 7" in model_name or "E34" in model_name:
+                lock_2 = str(core._last_data.get("34206_00001_00001", "1"))
+                if lock_2 == "0":
+                    is_unlocked = True
+                    
+            is_parked = (gear == "1") # P
+            
+            warnings = []
+            if open_doors: 
+                warnings.append(f"Đang mở {', '.join(open_doors)}")
+            if is_parked and is_unlocked: 
+                warnings.append("Chưa khóa xe")
+            
+            if warnings:
+                core._last_data["api_security_warning"] = " | ".join(warnings)
+            else:
+                core._last_data["api_security_warning"] = "An toàn"
+        except Exception as e: 
+            pass
+        # =====================================================================
 
         core.trigger_callbacks()

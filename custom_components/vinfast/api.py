@@ -61,6 +61,7 @@ class VinFastAPI:
             "api_home_charge_kwh": 0.0,
             "api_home_charge_sessions": 0,
             "api_ai_advisor": ai_state,
+            "api_security_warning": "An toàn" if self.lang == "vi" else "Safe",
             "api_best_efficiency_band": "Chưa đủ dữ liệu" if self.lang == "vi" else "Not enough data",
             "api_est_range_degradation": 0.0,
             "api_debug_raw": "Chờ kết nối MQTT..." if self.lang == "vi" else "Waiting for MQTT..."
@@ -208,9 +209,6 @@ class VinFastAPI:
 
         except Exception: pass
 
-    # =================================================================================
-    # THUẬT TOÁN NẮN ĐƯỜNG NGẦM (BACKGROUND ASYNC MAP MATCHING)
-    # =================================================================================
     async def async_smooth_trip_background(self, trip_id, raw_route):
         if not raw_route or len(raw_route) < 3: return
 
@@ -253,7 +251,6 @@ class VinFastAPI:
             _LOGGER.error(f"VinFast: Lỗi khi ghi Cache nắn đường: {e}")
 
     async def async_fix_all_historical_trips(self, force=False):
-        """Quét lịch sử. Nếu force=True, ép nắn lại 5 chuyến đi gần nhất để sửa lỗi đường chim bay."""
         trip_file = os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
         if not os.path.exists(trip_file): return
 
@@ -310,7 +307,7 @@ class VinFastAPI:
                         self._trip_start_odo = mem.get("trip_start_odo", 0.0)
                         self._trip_start_time = mem.get("trip_start_time", time.time())
                         self._trip_start_soc = mem.get("trip_start_soc", 100.0)
-                        self._trip_accumulated_distance_m = mem.get("trip_accumulated_distance_m", 0.0)
+                        self._trip_accumulated_distance_m = mem.get("trip_accumulated_distance_m", 0.0) 
                         self._eff_soc = mem.get("eff_soc", None)
                         self._eff_gps_dist = mem.get("eff_gps_dist", 0.0)
                         self._eff_time = mem.get("eff_time", None)
@@ -333,7 +330,6 @@ class VinFastAPI:
             self._last_data["api_vehicle_name"] = self.vehicle_model_display or "Xe VinFast"
             
         if hasattr(self, 'hass') and self.hass:
-            # Lúc khởi động tự nhiên chỉ quét lại chuyến lỗi (Force=False)
             asyncio.run_coroutine_threadsafe(self.async_fix_all_historical_trips(force=False), self.hass.loop)
 
     def _save_state(self):

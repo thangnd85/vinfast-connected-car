@@ -90,8 +90,7 @@ class VinFastSensor(SensorEntity):
                 elif val_clean in ["0", "3", "4"]: self._attr_native_value = "Không Sạc" if vi else "Not Charging"
                 else: self._attr_native_value = val
 
-            # --- SỬA LẠI NHÓM KHÓA CỬA CHO VF6 ---
-            elif self._device_key in ["34213_00001_00003", "34206_00001_00001"]:
+            elif self._device_key == "34213_00001_00003":
                 if val_clean == "1": self._attr_native_value = "Đã Khóa" if vi else "Locked"
                 elif val_clean == "0": self._attr_native_value = "Mở Khóa" if vi else "Unlocked"
                 else: self._attr_native_value = val
@@ -101,7 +100,17 @@ class VinFastSensor(SensorEntity):
                 elif val_clean == "0": self._attr_native_value = "Đã Tắt An Ninh" if vi else "Disarmed"
                 else: self._attr_native_value = val
 
-            # --- XÓA 34206 KHỎI ĐÂY (VÌ NÓ ĐÃ THÀNH KHÓA CỬA TRÊN VF6) ---
+            # --- LOGIC PHÂN BIỆT THÔNG MINH CHO MÃ 34206 ---
+            elif self._device_key == "34206_00001_00001":
+                if self._attr_name == "Khóa tổng": # Xử lý cho nhóm VF5/6/7
+                    if val_clean == "1": self._attr_native_value = "Đã Khóa" if vi else "Locked"
+                    elif val_clean == "0": self._attr_native_value = "Mở Khóa" if vi else "Unlocked"
+                    else: self._attr_native_value = val
+                else: # Xử lý cho nhóm VF3/8/9 (Cắm trại)
+                    if val_clean == "1": self._attr_native_value = "Đang Bật" if vi else "On"
+                    elif val_clean == "0": self._attr_native_value = "Đã Tắt" if vi else "Off"
+                    else: self._attr_native_value = val
+
             elif self._device_key in ["34205_00001_00001", "34207_00001_00001", "34186_00005_00004"]:
                 if val_clean == "1": self._attr_native_value = "Đang Bật" if vi else "On"
                 elif val_clean == "0": self._attr_native_value = "Đã Tắt" if vi else "Off"
@@ -141,7 +150,6 @@ class VinFastSensor(SensorEntity):
                 elif val_clean == "1": self._attr_native_value = "Bật sấy kính lái" if vi else "Defrost On"
                 else: self._attr_native_value = val
 
-            # --- THÊM XỬ LÝ CHO ĐÈN PHA ---
             elif self._device_key in ["34213_00004_00003", "56789_00001_00005"]:
                 if val_clean == "0": self._attr_native_value = "Tắt" if vi else "Off"
                 elif val_clean == "1": self._attr_native_value = "Bật" if vi else "On"
