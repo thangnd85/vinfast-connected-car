@@ -70,7 +70,6 @@ class AuthManager:
                 self.core.vehicle_model_display = v.get("marketingName") or v.get("dmsVehicleModel") or "VF"
                 self.core._last_data["api_vehicle_model"] = self.core.vehicle_model_display
                 
-                # BẢN VÁ: Ưu tiên Biển số xe làm tên định danh
                 plate = v.get("licensePlate")
                 custom_name = v.get("customizedVehicleName")
                 
@@ -227,17 +226,41 @@ class AuthManager:
         except Exception: pass
         return False
 
-    def fetch_nearby_stations(self):
+    def fetch_nearby_stations(self, force=False):
+        """Tải danh sách trạm sạc lân cận với bán kính động"""
         try:
+            now = time.time()
+            # Chống spam API (Nếu không bị force, giới hạn gọi 60s/lần)
+            if not force and now - getattr(self.core, '_last_station_fetch_time', 0) < 60:
+                return
+
             if not self.core._last_lat_lon: return
             lat_str, lon_str = self.core._last_lat_lon.split(',')
+            
+            # LOGIC BÁN KÍNH ĐỘNG: Lấy quãng đường còn lại làm chuẩn
+            remain_range = safe_float(self.core._last_data.get("api_calc_remain_range", self.core._last_data.get("34180_00001_00007", 50)))
+            
+            # Đổi sang mét. Bán kính nhỏ nhất là 10km, lớn nhất là 100km
+            search_radius = int(min(max(remain_range * 1000, 10000), 100000))
+            
             ts = int(time.time() * 1000)
             headers = self._get_base_headers()
-            headers.update({"X-HASH": self._generate_x_hash("POST", "ccarcharging/api/v1/stations/search", self.core.vin, ts), "X-HASH-2": self._generate_x_hash_2("android", self.core.vin, DEVICE_ID, "ccarcharging/api/v1/stations/search", "POST", ts), "X-TIMESTAMP": str(ts)})
-            payload = {"latitude": float(lat_str), "longitude": float(lon_str), "radius": 50000, "excludeFavorite": False, "stationType": [], "status": [], "brandIds": []}
+            headers.update({
+                "X-HASH": self._generate_x_hash("POST", "ccarcharging/api/v1/stations/search", self.core.vin, ts), 
+                "X-HASH-2": self._generate_x_hash_2("android", self.core.vin, DEVICE_ID, "ccarcharging/api/v1/stations/search", "POST", ts), 
+                "X-TIMESTAMP": str(ts)
+            })
+            
+            payload = {
+                "latitude": float(lat_str), 
+                "longitude": float(lon_str), 
+                "radius": search_radius, 
+                "excludeFavorite": False, "stationType": [], "status": [], "brandIds": []
+            }
             
             res = requests.post(f"{self.core.api_base}/ccarcharging/api/v1/stations/search?page=0&size=50", headers=headers, json=payload, timeout=15)
             if res and res.status_code == 200:
+                self.core._last_station_fetch_time = now
                 data = res.json().get("data", [])
                 if isinstance(data, dict) and "content" in data: data = data.get("content", [])
                 stations = []
@@ -246,7 +269,10 @@ class AuthManager:
                     st_lng = safe_float(st.get("longitude"))
                     if not st_lat or not st_lng: continue
                     dist = round(safe_float(st.get("distance", 0))/1000, 1)
-                    if dist > 80.0: continue
+                    
+                    # Bỏ qua các trạm bị API trả thừa ngoài bán kính quét + biên độ 2km
+                    if dist > (search_radius / 1000) + 2.0: continue 
+                    
                     max_power, avail, total = 0, 0, 0
                     for evse in st.get("evsePowers", []):
                         avail += int(evse.get("numberOfAvailableEvse", 0))
@@ -325,7 +351,6 @@ class AuthManager:
                         home_kwh = safe_float(self.core._last_data.get("api_home_charge_kwh", 0.0))
                         self.core._last_data["api_total_energy_charged"] = round(public_energy + home_kwh, 2)
 
-                        # --- BẢN VÁ: TÍNH HIỆU SUẤT SẠC DC TRẠM ---
                         if valid_sessions:
                             last_s = valid_sessions[0]
                             s_start = safe_float(last_s.get("startBatteryLevel", 0))

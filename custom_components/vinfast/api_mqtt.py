@@ -115,6 +115,13 @@ class MQTTManager:
                     if time_since_last_wakeup > 180:
                         core.auth.register_resources() 
 
+                # =======================================================
+                # ĐỊNH KỲ QUÉT TRẠM SẠC LÂN CẬN (15 PHÚT MỘT LẦN)
+                # =======================================================
+                if now - getattr(self, '_last_periodic_station_fetch', 0) >= 900:
+                    self._last_periodic_station_fetch = now
+                    threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": False}, daemon=True).start()
+
                 time_since_move = now - getattr(core, '_last_actual_move_time', now)
                 if getattr(core, '_is_trip_active', False) and not getattr(core, '_is_moving', False) and time_since_move >= 300:
                     core._is_trip_active = False 
@@ -125,7 +132,10 @@ class MQTTManager:
                     soc_end = safe_float(core._last_data.get("34183_00001_00009", core._last_data.get("34180_00001_00011", 50)))
                     soc_drop = soc_start - soc_end
                     
-                    if trip_dist >= 0.5: 
+                    std_range = safe_float(core._last_data.get("api_static_range", 210))
+                    expected_km_per_1 = (std_range / 100.0) if std_range > 0 else 2.1
+                    
+                    if trip_dist >= expected_km_per_1: 
                         threading.Thread(target=self._run_ai_advisor_wrapper, args=("trip", {"dist": trip_dist, "drop": soc_drop}), daemon=True).start()
                         
                     core._trip_start_odo = 0.0
@@ -154,9 +164,17 @@ class MQTTManager:
                     core._last_data["api_outside_temp"] = w_data["temp"]
                     core._last_data["api_weather_condition"] = w_data["condition"]
                     core._last_data["api_hvac_load_estimate"] = w_data["hvac"]
-                    if now - getattr(core, '_last_ai_weather_time', 0) > 1800 and (w_data["temp"] >= 38 or w_data["temp"] <= 15 or w_data["code"] in [80, 81, 82, 95, 96, 99]):
+                    
+                    bad_wmo_codes = [45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99]
+                    is_bad_weather = w_data["code"] in bad_wmo_codes
+                    is_extreme_temp = w_data["temp"] >= 35 or w_data["temp"] <= 15
+                    cond_lower = str(w_data["condition"]).lower()
+                    has_bad_keyword = any(k in cond_lower for k in ["mưa", "bão", "sương mù", "tuyết", "gió", "sấm chớp", "mù"])
+
+                    if now - getattr(core, '_last_ai_weather_time', 0) > 1800 and (is_bad_weather or is_extreme_temp or has_bad_keyword):
                         core._last_ai_weather_time = now
                         threading.Thread(target=self._run_ai_advisor_wrapper, args=("weather", {"temp": w_data["temp"], "cond": w_data["condition"]}), daemon=True).start()
+                        
                     core._save_state()
                     core.trigger_callbacks()
                     
@@ -168,7 +186,8 @@ class MQTTManager:
                     if addr:
                         core._last_data["api_current_address"] = addr
                         core._last_geocoded_grid = grid_coord 
-                        threading.Thread(target=core.auth.fetch_nearby_stations, daemon=True).start()
+                        # Khi xe sang vùng địa lý mới (có địa chỉ mới), LẬP TỨC quét lại trạm sạc xung quanh
+                        threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": True}, daemon=True).start()
                     else:
                         core._last_data["api_current_address"] = f"Lat/Lon: {lat:.5f}, {lon:.5f}"
                     core._save_state()
@@ -338,20 +357,24 @@ class MQTTManager:
                             distance_m = R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
                             
                             time_diff = current_time - core._last_gps_time
-                            implied_speed_kmh = (distance_m / (time_diff if time_diff > 0 else 1)) * 3.6
                             
                             is_valid_point = True
-                            if actual_speed_kmh == 0 and distance_m > 15.0: is_valid_point = False
-                            elif implied_speed_kmh > max(120.0, actual_speed_kmh + 50.0): is_valid_point = False
+                            if time_diff > 0:
+                                implied_speed_kmh = (distance_m / time_diff) * 3.6
+                                if implied_speed_kmh > 180.0: 
+                                    is_valid_point = False
+                                    
+                            if actual_speed_kmh == 0 and distance_m > 30.0: 
+                                is_valid_point = False
 
-                            if is_valid_point:
-                                if distance_m >= max(5.0, (actual_speed_kmh * 1000 / 3600)):
-                                    core._trip_accumulated_distance_m += distance_m
-                                    core._eff_gps_dist += distance_m
-                                    core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
-                                if len(core._route_coords) > 1500: core._route_coords.pop(0) 
-                                core._last_data["api_trip_route"] = json.dumps(core._route_coords)
+                            if is_valid_point and distance_m > 0:
+                                core._trip_accumulated_distance_m += distance_m
+                                core._eff_gps_dist += distance_m
+                                core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
                                 core._last_gps_time = current_time
+                                
+                                if len(core._route_coords) > 2500: core._route_coords.pop(0) 
+                                core._last_data["api_trip_route"] = json.dumps(core._route_coords)
                                 
             if getattr(core, '_is_trip_active', False):
                 final_trip_dist = core._trip_accumulated_distance_m / 1000.0
@@ -578,9 +601,6 @@ class MQTTManager:
 
         except Exception: pass
 
-        # =====================================================================
-        # THUẬT TOÁN TỔNG HỢP CẢNH BÁO AN NINH (Theo Model xe)
-        # =====================================================================
         try:
             open_doors = []
             
@@ -604,13 +624,12 @@ class MQTTManager:
             lock_1 = str(core._last_data.get("34213_00001_00003", "1"))
             is_unlocked = (lock_1 == "0")
             
-            # VF5, 6, 7, e34 dùng mã 34206 làm Khóa cửa phụ
             if "VF5" in model_name or "VF 5" in model_name or "VF6" in model_name or "VF 6" in model_name or "VF7" in model_name or "VF 7" in model_name or "E34" in model_name:
                 lock_2 = str(core._last_data.get("34206_00001_00001", "1"))
                 if lock_2 == "0":
                     is_unlocked = True
                     
-            is_parked = (gear == "1") # P
+            is_parked = (gear == "1") 
             
             warnings = []
             if open_doors: 
@@ -624,6 +643,5 @@ class MQTTManager:
                 core._last_data["api_security_warning"] = "An toàn"
         except Exception as e: 
             pass
-        # =====================================================================
 
         core.trigger_callbacks()

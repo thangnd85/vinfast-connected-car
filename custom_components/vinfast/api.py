@@ -4,6 +4,7 @@ import time
 import logging
 import threading
 import asyncio
+import datetime
 from .const import WWW_DIR, REGION_CONFIG
 from .api_auth import AuthManager
 from .api_mqtt import MQTTManager
@@ -209,7 +210,10 @@ class VinFastAPI:
 
         except Exception: pass
 
-    async def async_smooth_trip_background(self, trip_id, raw_route):
+    # =================================================================================
+    # THUẬT TOÁN NẮN ĐƯỜNG NGẦM (HỖ TRỢ CẢ FILE CHÍNH VÀ FILE ARCHIVE)
+    # =================================================================================
+    async def async_smooth_trip_background(self, trip_id, raw_route, target_trip_file=None):
         if not raw_route or len(raw_route) < 3: return
 
         mapbox_token = self.options.get("mapbox_token", "")
@@ -218,7 +222,8 @@ class VinFastAPI:
         _LOGGER.warning(f"VinFast: [TRIP {trip_id}] Bắt đầu đẩy {len(raw_route)} tọa độ lên lưới AI Map Matching...")
         smoothed_route = await async_process_route(self.hass, raw_route, mapbox_token, stadia_token)
 
-        trip_file = os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
+        # Nếu không truyền file cụ thể, mặc định lưu vào file chính
+        trip_file = target_trip_file if target_trip_file else os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
         try:
             def update_json_file():
                 if not os.path.exists(trip_file): return False
@@ -236,12 +241,12 @@ class VinFastAPI:
                     with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips, f, ensure_ascii=False)
                 return updated
 
-            _LOGGER.warning(f"VinFast: [TRIP {trip_id}] Đã nắn xong! Đang mở file JSON để lưu...")
+            _LOGGER.warning(f"VinFast: [TRIP {trip_id}] Đã nắn xong! Đang ghi lại vào {os.path.basename(trip_file)}...")
             updated = await self.hass.async_add_executor_job(update_json_file)
             
             if updated:
                 _LOGGER.warning(f"VinFast: [TRIP {trip_id}] -> GHI FILE JSON THÀNH CÔNG!")
-                if getattr(self, '_last_data', {}).get("api_trip_route"):
+                if getattr(self, '_last_data', {}).get("api_trip_route") and "archive" not in trip_file:
                     self._last_data["api_trip_route"] = json.dumps(smoothed_route)
                     self.trigger_callbacks()
             else:
@@ -251,41 +256,58 @@ class VinFastAPI:
             _LOGGER.error(f"VinFast: Lỗi khi ghi Cache nắn đường: {e}")
 
     async def async_fix_all_historical_trips(self, force=False):
-        trip_file = os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
-        if not os.path.exists(trip_file): return
+        """Quét và nắn đường cho cả File Trip Chính và File Archive (Lưu trữ tháng)"""
+        vin_str = self.vin.lower()
+        now = datetime.datetime.now()
+        
+        # Tạo danh sách các file cần quét (File chính, file tháng này, file tháng trước)
+        prev_month = now.replace(day=1) - datetime.timedelta(days=1)
+        files_to_check = [
+            os.path.join(WWW_DIR, f"vinfast_trips_{vin_str}.json"),
+            os.path.join(WWW_DIR, f"vinfast_trips_archive_{vin_str}_{now.strftime('%Y_%m')}.json"),
+            os.path.join(WWW_DIR, f"vinfast_trips_archive_{vin_str}_{prev_month.strftime('%Y_%m')}.json")
+        ]
 
-        try:
-            def read_trips():
-                with open(trip_file, 'r', encoding='utf-8') as f: return json.load(f)
-            
-            trips = await self.hass.async_add_executor_job(read_trips)
-            pending_trips = []
+        total_fixed = 0
+        for trip_file in files_to_check:
+            if not os.path.exists(trip_file): continue
 
-            for i, trip in enumerate(trips):
-                is_recent = (i < 5)
-                if not trip.get("is_smoothed", False) or (force and is_recent):
-                    pending_trips.append(trip)
+            try:
+                def read_trips():
+                    with open(trip_file, 'r', encoding='utf-8') as f: return json.load(f)
+                
+                trips = await self.hass.async_add_executor_job(read_trips)
+                pending_trips = []
 
-            if not pending_trips:
-                _LOGGER.warning("VinFast: Bản đồ đã tối ưu. Không có chuyến đi nào cần nắn thêm.")
-                return
-
-            _LOGGER.warning(f"VinFast: Tìm thấy {len(pending_trips)} chuyến đi cần xử lý (Force={force}). Khởi động AI...")
-
-            for trip in pending_trips:
-                raw_route = trip.get("route", [])
-                if len(raw_route) > 2:
-                    await self.async_smooth_trip_background(trip.get("id"), raw_route)
-                    await asyncio.sleep(2.0) 
-                else:
-                    trip["is_smoothed"] = True 
-                    def save_trip_ignore():
-                        with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips, f, ensure_ascii=False)
-                    await self.hass.async_add_executor_job(save_trip_ignore)
+                for i, trip in enumerate(trips):
+                    is_recent = (i < 5)
+                    is_archived = "archive" in trip_file
                     
-            _LOGGER.warning("VinFast: HOÀN TẤT QUÁ TRÌNH QUÉT LỊCH SỬ!")
-        except Exception as e:
-            _LOGGER.error(f"VinFast: Lỗi quét lịch sử nắn đường: {e}")
+                    # Ưu tiên sửa chuyến chưa smooth. Nếu force=True thì chỉ ép nắn lại 5 chuyến gần nhất của file chính
+                    if not trip.get("is_smoothed", False) or (force and is_recent and not is_archived):
+                        pending_trips.append(trip)
+
+                if pending_trips:
+                    _LOGGER.warning(f"VinFast: Quét thấy {len(pending_trips)} chuyến đi cần nắn thẳng trong file {os.path.basename(trip_file)}")
+
+                for trip in pending_trips:
+                    raw_route = trip.get("route", [])
+                    if len(raw_route) > 2:
+                        await self.async_smooth_trip_background(trip.get("id"), raw_route, target_trip_file=trip_file)
+                        total_fixed += 1
+                        await asyncio.sleep(2.0) 
+                    else:
+                        trip["is_smoothed"] = True 
+                        def save_trip_ignore():
+                            with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips, f, ensure_ascii=False)
+                        await self.hass.async_add_executor_job(save_trip_ignore)
+            except Exception as e:
+                _LOGGER.error(f"VinFast: Lỗi khi đọc file {os.path.basename(trip_file)}: {e}")
+                
+        if total_fixed == 0:
+            _LOGGER.warning("VinFast: Bản đồ đã được tối ưu toàn bộ. Không có chuyến đi nào cần nắn thêm.")
+        else:
+            _LOGGER.warning(f"VinFast: HOÀN TẤT NẮN {total_fixed} CHUYẾN ĐI (Bao gồm cả Archive)!")
 
     def _load_state(self):
         if not self.vin: return
@@ -378,6 +400,8 @@ class VinFastAPI:
         try:
             import datetime
             os.makedirs(WWW_DIR, exist_ok=True)
+            # Việc ghi file archive sẽ do script bên ngoài xử lý, 
+            # API chỉ cần ghi vào file chính như bình thường.
             trip_file = os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
             trips = []
             if os.path.exists(trip_file):
@@ -405,11 +429,12 @@ class VinFastAPI:
                     "is_smoothed": False 
                 }
                 trips.insert(0, new_trip) 
+                # Giới hạn giữ lại 50 chuyến ở file chính để tránh quá tải
                 with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips[:50], f, ensure_ascii=False)
 
                 if hasattr(self, 'hass') and self.hass:
                     asyncio.run_coroutine_threadsafe(
-                        self.async_smooth_trip_background(trip_id, draft_route),
+                        self.async_smooth_trip_background(trip_id, draft_route, target_trip_file=trip_file),
                         self.hass.loop
                     )
         except Exception as e: 
