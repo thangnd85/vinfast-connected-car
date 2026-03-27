@@ -91,9 +91,9 @@ def get_projected_pt(pt, pt_a, pt_b, allow_extend_start=False, allow_extend_end=
     d = haversine_distance(pt[0], pt[1], py, px)
     return [py, px], t, d
 
+# Hàm giữ nguyên nhưng không gọi tự động để tránh cắt sai
 def trim_route_to_projections(offset_route, coords):
     if len(offset_route) < 2 or len(coords) < 2: return offset_route
-    
     raw_start = coords[0]
     min_d_start = float('inf')
     best_proj_start = None
@@ -141,7 +141,19 @@ def trim_route_to_projections(offset_route, coords):
     
     return final_route
 
+def light_cleanup(coords, min_dist=0.1):
+    """Chỉ loại bỏ những điểm hoàn toàn trùng lặp để tránh lỗi toán học chia cho 0"""
+    if len(coords) < 2: return coords
+    cleaned = [coords[0]]
+    for i in range(1, len(coords)):
+        if haversine_distance(cleaned[-1][0], cleaned[-1][1], coords[i][0], coords[i][1]) >= min_dist:
+            cleaned.append(coords[i])
+    if haversine_distance(cleaned[-1][0], cleaned[-1][1], coords[-1][0], coords[-1][1]) > 0.05:
+        cleaned.append(coords[-1])
+    return cleaned
+
 def offset_route_right(coords, offset_meters=1.5):
+    """Dạt lề phải 1.5m để đi đúng làn đường"""
     if not coords or len(coords) < 2: return coords
     shifted = []
     n = len(coords)
@@ -175,8 +187,6 @@ def assign_speeds(smooth_coords, original_coords):
         res.append([sp[0], sp[1], closest_speed])
     return res
 
-
-# ================= CƠ CHẾ KINEMATICS & HYBRID MATCHING =================
 def moving_average_smooth(coords, window=3):
     if len(coords) < window: return coords
     smoothed = []
@@ -192,57 +202,29 @@ def moving_average_smooth(coords, window=3):
     return smoothed
 
 def kinematic_filter(raw_coords):
-    """
-    LỚP PHÒNG THỦ 1: Dùng Vận Tốc và Thời Gian để gọt bỏ Rác GPS.
-    S = V * T. Nếu khoảng cách thực tế lớn hơn giới hạn vật lý -> Bỏ!
-    """
-    if not raw_coords or len(raw_coords) < 2: 
-        return raw_coords
-    
+    """Lọc bỏ các điểm nhảy tọa độ quá xa (Glitch) do lỗi thiết bị GPS"""
+    if not raw_coords or len(raw_coords) < 2: return raw_coords
     cleaned = [raw_coords[0]]
-    
     for i in range(1, len(raw_coords)):
         prev = cleaned[-1]
         curr = raw_coords[i]
-        
         dist = haversine_distance(prev[0], prev[1], curr[0], curr[1])
-        
-        # Trích xuất timestamp an toàn
         t_prev = prev[3] if len(prev) > 3 else 0
         t_curr = curr[3] if len(curr) > 3 else 0
         dt = max(1, t_curr - t_prev) if t_curr > 0 and t_prev > 0 else 2
-        
         v_kmh = max(curr[2] if len(curr) > 2 else 0, prev[2] if len(prev) > 2 else 0)
         v_ms = v_kmh / 3.6
-        
-        # Quãng đường vật lý tối đa có thể đi được trong khoảng dt (Cộng sai số cố định 20m của GPS)
-        max_phys_dist = (v_ms * dt) + 20.0
-        
-        if dist > max_phys_dist and dist > 30.0:
-            _LOGGER.debug(f"Đã chặt đứt rác GPS (Kinematics): Khoảng cách {dist:.1f}m > Giới hạn {max_phys_dist:.1f}m")
+        max_phys_dist = (v_ms * dt) + 150.0 # Khoảng sai số rộng rãi để không mất điểm
+        if dist > max_phys_dist and dist > 300.0:
             continue
-            
         cleaned.append(curr)
-        
     return cleaned
+
+# ================= CƠ CHẾ THÁC NƯỚC BẤT ĐỒNG BỘ =================
 
 async def fetch_map_matching_api_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token):
     coord_str = ";".join([f"{p[1]:.5f},{p[0]:.5f}" for p in chunk])
-    
-    # LỚP PHÒNG THỦ 2: BÁN KÍNH ĐỘNG HỌC (DYNAMIC RADIUS)
-    # Bán kính tìm đường tỷ lệ thuận với Quãng đường = Vận tốc * Thời gian
-    dynamic_radiuses = []
-    for i in range(len(chunk)):
-        spd_kmh = chunk[i][2] if len(chunk[i]) > 2 else 0
-        spd_ms = spd_kmh / 3.6
-        dt = max(1, int(chunk_timestamps[i]) - int(chunk_timestamps[i-1])) if i > 0 else 2
-        
-        # Giới hạn khóa cứng AI: Bán kính từ 10m đến 25m.
-        # Nếu tốc độ thấp, nó không được phép hút tọa độ sang đường bên cạnh.
-        r = max(10.0, min(25.0, spd_ms * dt))
-        dynamic_radiuses.append(str(int(r)))
-        
-    radiuses = ";".join(dynamic_radiuses)
+    radiuses = ";".join(["40"] * len(chunk)) 
     bearings_str = ";".join(chunk_bearings)
     timestamps_str = ";".join(map(str, chunk_timestamps))
     
@@ -278,7 +260,7 @@ async def fetch_map_matching_api_async(session, chunk, chunk_bearings, chunk_tim
                         return coords, "Stadia"
         except Exception: pass
 
-    headers = {"User-Agent": "HA-VinFast-Hybrid/22.0"}
+    headers = {"User-Agent": "HA-VinFast-Hybrid/21.0"}
     for server in OSRM_SERVERS:
         url = f"{server}/match/v1/driving/{coord_str}?overview=full&geometries=geojson&radiuses={radiuses}&bearings={bearings_str}&timestamps={timestamps_str}&tidy=true"
         try:
@@ -295,33 +277,25 @@ async def fetch_map_matching_api_async(session, chunk, chunk_bearings, chunk_tim
     return None, "Error"
 
 async def recursive_hybrid_match_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token, depth=0):
-    # Dừng cắt nếu chunk quá ngắn để nắn
-    if len(chunk) < 2 or calculate_route_length(chunk) < 20.0 or depth > 3 or len(chunk) <= 3: 
-        return [[p[0], p[1], p[2] if len(p)>2 else 0] for p in chunk]
+    if len(chunk) < 2 or calculate_route_length(chunk) < 40.0 or depth > 4 or len(chunk) <= 3: 
+        return chunk 
         
     matched_coords, engine = await fetch_map_matching_api_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token)
     
-    if isinstance(matched_coords, list) and len(matched_coords) > 0:
+    if isinstance(matched_coords, list):
         raw_dist = calculate_route_length(chunk)
         api_dist = calculate_route_length(matched_coords)
         
-        # LỚP PHÒNG THỦ 3: CHỐNG LÒNG VÒNG (ANTI-DETOUR)
-        # Nếu AI nắn đường mà làm tổng lộ trình dài hơn Tọa độ Gốc > 20% và sai số > 20 mét
-        # Nghĩa là nó đã bẻ lái sai sang các đường ngang dọc. Ta ép nó dùng toạ độ RAW làm chuẩn.
-        if raw_dist > 0 and (api_dist > raw_dist * 1.20) and (api_dist - raw_dist > 20.0): 
-            _LOGGER.warning(f"      [-] Từ chối AI {engine} vì đi lòng vòng ({api_dist:.1f}m > RAW {raw_dist:.1f}m). Cắt nhỏ ép bám đường...")
-            if depth < 2:
-                return await split_and_recurse_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token, depth)
-            else:
-                return [[p[0], p[1], p[2] if len(p)>2 else 0] for p in chunk]
+        # Ngăn chặn việc API tự ý kéo dài lộ trình vô lý (nhảy làn cao tốc, đi lòng vòng)
+        if raw_dist > 0 and api_dist > raw_dist * 1.50: 
+            _LOGGER.warning(f"      [-] {engine} đi vòng ({api_dist:.1f}m > {raw_dist:.1f}m). CẮT ĐÔI...")
+            return await split_and_recurse_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token, depth)
             
-        _LOGGER.warning(f"      [+] AI {engine} bám đường chuẩn xác (Dài API: {api_dist:.1f}m)")
+        _LOGGER.warning(f"      [+] Khớp {engine} HOÀN HẢO! (Dài API: {api_dist:.1f}m)")
         return matched_coords
     else:
-        _LOGGER.warning(f"      [!] AI {engine} từ chối đoạn này. Dùng GPS gốc làm tham chiếu...")
-        if depth < 2:
-            return await split_and_recurse_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token, depth)
-        return [[p[0], p[1], p[2] if len(p)>2 else 0] for p in chunk]
+        _LOGGER.warning(f"      [!] API ({engine}) từ chối đoạn nhiễu. CẮT ĐÔI...")
+        return await split_and_recurse_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token, depth)
 
 async def split_and_recurse_async(session, chunk, chunk_bearings, chunk_timestamps, mapbox_token, stadia_token, depth):
     mid = len(chunk) // 2
@@ -333,69 +307,40 @@ async def split_and_recurse_async(session, chunk, chunk_bearings, chunk_timestam
 async def async_process_route(hass, raw_coords, mapbox_token, stadia_token):
     if not raw_coords or len(raw_coords) < 5: return raw_coords
     
-    # BƯỚC 1: LỌC RÁC GPS BẰNG KINEMATICS
-    filtered_coords = kinematic_filter(raw_coords)
-    
-    _LOGGER.warning(f"[1] TỌA ĐỘ GỐC: {len(raw_coords)} điểm. LỌC ĐỘNG HỌC CÒN: {len(filtered_coords)} điểm. Dài: {calculate_route_length(filtered_coords):.1f}m")
+    _LOGGER.warning(f"[1] TỌA ĐỘ GỐC: {len(raw_coords)} điểm. Chiều dài: {calculate_route_length(raw_coords):.1f}m")
     session = async_get_clientsession(hass)
 
-    # CÁCH LY VÙNG NHIỄU (Bãi đỗ xe)
-    start_road_idx = 0
-    end_road_idx = len(filtered_coords) - 1
+    # BƯỚC 1: LÀM SẠCH LỖI VÀ NHIỄU (Bảo toàn 100% chuyến đi kể cả tắc đường)
+    cleaned_raw = kinematic_filter(raw_coords)
+    cleaned_raw = light_cleanup(cleaned_raw, min_dist=0.1)
+    if len(cleaned_raw) < 2: return raw_coords
     
-    for i in range(len(filtered_coords)):
-        spd = filtered_coords[i][2] if len(filtered_coords[i]) > 2 else 0
-        if spd >= 12.0:
-            start_road_idx = max(0, i - 2) 
-            break
-            
-    for i in range(len(filtered_coords)-1, -1, -1):
-        spd = filtered_coords[i][2] if len(filtered_coords[i]) > 2 else 0
-        if spd >= 12.0:
-            end_road_idx = min(len(filtered_coords) - 1, i + 2) 
-            break
-            
-    if start_road_idx >= end_road_idx - 5:
-        start_road_idx, end_road_idx = 0, len(filtered_coords) - 1
-        
-    road_coords = filtered_coords[start_road_idx : end_road_idx + 1]
-    _LOGGER.warning(f"[2] TRÍCH XUẤT ĐƯỜNG TRƯỜNG: Bỏ qua bãi đỗ, gửi {len(road_coords)} điểm lên AI.")
-
-    # BƯỚC 2: CHUẨN BỊ TIMESTAMPS VÀ BEARINGS
     global_bearings = []
     global_timestamps = []
     current_time = 1600000000 
     
-    for i in range(len(road_coords)):
-        if i < len(road_coords) - 1: 
-            b = get_bearing(road_coords[i][0], road_coords[i][1], road_coords[i+1][0], road_coords[i+1][1])
-        elif i > 0: 
-            b = get_bearing(road_coords[i-1][0], road_coords[i-1][1], road_coords[i][0], road_coords[i][1])
-        else: 
-            b = 0
+    for i in range(len(cleaned_raw)):
+        if i < len(cleaned_raw) - 1: b = get_bearing(cleaned_raw[i][0], cleaned_raw[i][1], cleaned_raw[i+1][0], cleaned_raw[i+1][1])
+        elif i > 0: b = get_bearing(cleaned_raw[i-1][0], cleaned_raw[i-1][1], cleaned_raw[i][0], cleaned_raw[i][1])
+        else: b = 0
         
         global_bearings.append(f"{int(b)},120")
         
-        # Đồng bộ Timestamps
-        if len(road_coords[i]) > 3:
-            global_timestamps.append(int(road_coords[i][3]))
+        if i == 0: global_timestamps.append(current_time)
         else:
-            if i == 0: 
-                global_timestamps.append(current_time)
-            else:
-                d = haversine_distance(road_coords[i-1][0], road_coords[i-1][1], road_coords[i][0], road_coords[i][1])
-                spd = road_coords[i-1][2] if len(road_coords[i-1]) > 2 else 30.0
-                dt = max(1, int(d / (max(10.0, spd) / 3.6)))
-                current_time += dt
-                global_timestamps.append(current_time)
+            d = haversine_distance(cleaned_raw[i-1][0], cleaned_raw[i-1][1], cleaned_raw[i][0], cleaned_raw[i][1])
+            spd = cleaned_raw[i-1][2] if len(cleaned_raw[i-1]) > 2 else 30.0
+            dt = max(1, int(d / (max(10.0, spd) / 3.6)))
+            current_time += dt
+            global_timestamps.append(current_time)
 
     final_matched_route = []
     is_mapbox = bool(mapbox_token and str(mapbox_token).strip() != "")
     CHUNK_SIZE = 80 if is_mapbox else 40 
     OVERLAP = 2 
     
-    for i in range(0, len(road_coords), CHUNK_SIZE - OVERLAP):
-        chunk = road_coords[i:i+CHUNK_SIZE]
+    for i in range(0, len(cleaned_raw), CHUNK_SIZE - OVERLAP):
+        chunk = cleaned_raw[i:i+CHUNK_SIZE]
         chunk_b = global_bearings[i:i+CHUNK_SIZE]
         chunk_t = global_timestamps[i:i+CHUNK_SIZE]
         if len(chunk) < 2: continue
@@ -413,19 +358,24 @@ async def async_process_route(hass, raw_coords, mapbox_token, stadia_token):
     _LOGGER.warning(f"[3] BẢN ĐỒ TRẢ VỀ: {len(final_matched_route)} điểm.")
 
     # BƯỚC 4: GÁN TỐC ĐỘ VÀ TỊNH TIẾN LUÔN SÁT LỀ PHẢI
-    route_with_speed = assign_speeds(final_matched_route, road_coords)
+    route_with_speed = assign_speeds(final_matched_route, cleaned_raw)
     offset_route = offset_route_right(route_with_speed, offset_meters=1.5)
 
-    # BƯỚC 5: CẮT TỈA HÌNH CHIẾU THEO TOẠ ĐỘ GPS GỐC
-    _LOGGER.warning(f"[5] CẮT TỈA ĐẦU ĐUÔI THEO HÌNH CHIẾU (Chỉ bám đường)...")
-    final_offset_route = trim_route_to_projections(offset_route, filtered_coords)
-    
-    return final_offset_route
+    # BƯỚC 5: KHÓA CHẶT ĐIỂM ĐẦU VÀ CUỐI VỚI RAW GPS (Bắt buộc điểm nối trip phải chuẩn xác)
+    if len(offset_route) >= 2 and len(raw_coords) >= 2:
+        offset_route[0][0] = raw_coords[0][0]
+        offset_route[0][1] = raw_coords[0][1]
+        
+        offset_route[-1][0] = raw_coords[-1][0]
+        offset_route[-1][1] = raw_coords[-1][1]
+
+    # TRẢ VỀ TOÀN BỘ LỘ TRÌNH, KHÔNG DÙNG TRIM NỮA THEO YÊU CẦU
+    return offset_route
 
 # ================= QUẢN LÝ LƯU TRỮ CHUYẾN ĐI (JSON CACHE) =================
 
 def load_cache(hass):
-    path = hass.config.path(CACHE_FILE)
+    path = hass.config.path("www", CACHE_FILE)
     if os.path.exists(path):
         try:
             with open(path, 'r', encoding='utf-8') as f: return json.load(f)
@@ -433,7 +383,7 @@ def load_cache(hass):
     return {}
 
 def save_cache(hass, cache_data):
-    path = hass.config.path(CACHE_FILE)
+    path = hass.config.path("www", CACHE_FILE)
     try:
         with open(path, 'w', encoding='utf-8') as f: json.dump(cache_data, f, ensure_ascii=False)
     except Exception: pass
