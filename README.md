@@ -100,6 +100,7 @@ Mã nguồn cam kết không lưu trữ bất kỳ thông tin cá nhân hay mậ
 <img width="484"  alt="image" src="https://github.com/user-attachments/assets/cd5410a9-936f-459e-ba8f-a7628413b85c" />
 
 <img width="484" alt="image" src="https://github.com/user-attachments/assets/ca1d18dc-8d4d-46f9-a87e-57c492bffb17" />
+<img width="485" alt="image" src="https://github.com/user-attachments/assets/9c972cde-e56d-49d9-b7f9-f9e1ec05fba3" />
 
 <img width="484" alt="image" src="https://github.com/user-attachments/assets/fd32dc0c-70e1-4619-977c-49c19a3a2424" />
 
