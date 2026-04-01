@@ -7,6 +7,7 @@ import random
 import math
 import threading
 import paho.mqtt.client as mqtt
+import os
 
 from .const import WWW_DIR, MOCK_FILE
 from .api_helpers import get_address_from_osm, get_weather_data, get_osrm_route, get_ai_advice, safe_float
@@ -115,12 +116,10 @@ class MQTTManager:
                     if time_since_last_wakeup > 180:
                         core.auth.register_resources() 
 
-                # =======================================================================
-                # ĐÃ TÁCH KHỎI IF IS_MOVING: CẬP NHẬT TRẠM SẠC ĐỊNH KỲ MỖI 15 PHÚT
-                # =======================================================================
-                if now - getattr(self, '_last_periodic_station_fetch', 0) >= 900:
-                    self._last_periodic_station_fetch = now
-                    threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": True}, daemon=True).start()
+                if getattr(core, '_is_moving', False):
+                    if now - getattr(self, '_last_periodic_station_fetch', 0) >= 900:
+                        self._last_periodic_station_fetch = now
+                        threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": True}, daemon=True).start()
 
                 time_since_move = now - getattr(core, '_last_actual_move_time', now)
                 if getattr(core, '_is_trip_active', False) and not getattr(core, '_is_moving', False) and time_since_move >= 300:
@@ -329,7 +328,6 @@ class MQTTManager:
                 core._last_data["api_trip_efficiency"] = 0.0
                 core._trip_accumulated_distance_m = 0.0 
                 core._route_coords = [] 
-                
                 core._save_state()
         except Exception: pass
 
@@ -341,7 +339,6 @@ class MQTTManager:
                 curr_coord = f"{lat},{lon}"
                 if curr_coord != getattr(core, '_last_lat_lon', ""): 
                     core._last_lat_lon = curr_coord
-                    # BẮT BUỘC LƯU LẠI VỊ TRÍ ĐỂ TRẠM SẠC LUÔN CÓ TỌA ĐỘ NGAY CẢ KHI RESTART
                     core._last_data["api_last_lat"] = lat
                     core._last_data["api_last_lon"] = lon
                     
@@ -373,9 +370,7 @@ class MQTTManager:
 
                             if is_valid_point and distance_m > 0:
                                 core._trip_accumulated_distance_m += distance_m
-                                
                                 core._eff_gps_dist = getattr(core, '_eff_gps_dist', 0.0) + distance_m
-                                
                                 core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
                                 core._last_gps_time = current_time
                                 
@@ -492,6 +487,9 @@ class MQTTManager:
                 core._eff_gps_dist = 0.0
                 core._eff_ignored_first = False
                 
+                # [MỚI] TỰ ĐỘNG LẤY CÔNG SUẤT VÀ GIỚI HẠN SẠC NGAY LẬP TỨC (Real-time)
+                threading.Thread(target=core.auth.fetch_active_charging_session, daemon=True).start()
+                
                 core._save_state() 
                 
             elif core._is_charging and getattr(core, '_last_is_charging', False):
@@ -553,6 +551,36 @@ class MQTTManager:
                     except: pass
                     
                     if max_pwr > 0 and max_pwr <= 11.0: is_home_charge = True 
+                    
+                    # ======================================================================
+                    # TẠO MOCK LỊCH SỬ SẠC NGAY LẬP TỨC TRƯỚC KHI ĐỢI API TRẢ VỀ
+                    # ======================================================================
+                    try:
+                        date_str = datetime.datetime.fromtimestamp(getattr(core, '_charge_start_time', current_time)).strftime('%d/%m/%Y %H:%M')
+                        local_rec = {
+                            "date": date_str, 
+                            "address": "Sạc tại Nhà (Tạm tính)" if is_home_charge else "Trạm sạc VinFast (Đang đồng bộ...)", 
+                            "kwh": round(added_kwh, 2), 
+                            "duration": round(core._last_data.get("api_last_charge_duration", 0))
+                        }
+                        history_file = os.path.join(WWW_DIR, f"vinfast_charge_history_{core.vin.lower()}.json")
+                        hist_data = []
+                        if os.path.exists(history_file):
+                            with open(history_file, 'r', encoding='utf-8') as f: hist_data = json.load(f)
+                        
+                        if not hist_data or hist_data[0].get("date") != date_str:
+                            hist_data.insert(0, local_rec)
+                            with open(history_file, 'w', encoding='utf-8') as f: json.dump(hist_data[:20], f, ensure_ascii=False)
+                            
+                            # Tăng biến đếm để thẻ JS tự động Refresh file JSON
+                            if is_home_charge:
+                                core._last_data["api_home_charge_sessions"] = int(core._last_data.get("api_home_charge_sessions", 0)) + 1
+                            else:
+                                core._last_data["api_public_charge_sessions"] = int(core._last_data.get("api_public_charge_sessions", 0)) + 1
+                                
+                            core.trigger_callbacks()
+                    except Exception as e: 
+                        _LOGGER.error(f"Local history err: {e}")
                         
                     def verify_and_update_charge():
                         time.sleep(15)
@@ -583,7 +611,6 @@ class MQTTManager:
                                 break
 
                         if not api_success:
-                            core._last_data["api_home_charge_sessions"] = int(core._last_data.get("api_home_charge_sessions", 0)) + 1
                             core._last_data["api_home_charge_kwh"] = round(float(core._last_data.get("api_home_charge_kwh", 0.0)) + added_kwh, 2)
                         
                         core._save_state()
