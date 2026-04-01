@@ -63,7 +63,7 @@ class VinFastAPI:
             "api_home_charge_sessions": 0,
             "api_ai_advisor": ai_state,
             "api_security_warning": "An toàn" if self.lang == "vi" else "Safe",
-            "api_best_efficiency_band": "Chưa đủ dữ liệu" if self.lang == "vi" else "Not enough data",
+            "api_calc_range_per_percent": 0.0,
             "api_est_range_degradation": 0.0,
             "api_debug_raw": "Chờ kết nối MQTT..." if self.lang == "vi" else "Waiting for MQTT..."
         }  
@@ -85,11 +85,10 @@ class VinFastAPI:
         self._last_gps_time = time.time()
         self._trip_accumulated_distance_m = 0.0
         
-        self._eff_soc = None
-        self._eff_gps_dist = 0.0 
-        self._eff_time = None
-        self._eff_speeds = []
-        self._eff_stats = {}
+        self._eff_initial_soc = None
+        self._eff_start_soc = None
+        self._eff_gps_dist = 0.0
+        self._eff_ignored_first = False
         
         self._last_ai_anomaly_time = 0
         self._last_ai_weather_time = 0
@@ -128,6 +127,9 @@ class VinFastAPI:
     def get_vehicles(self): return self.auth.get_vehicles()
     def start_mqtt(self): self.mqtt.start()
     def send_remote_command(self, cmd, params=None): return self.auth.send_remote_command(cmd, params)
+    
+    # KẾT NỐI HÀM NÚT BẤM (BUTTON.PY) GỌI TẢI LẠI TRẠM SẠC
+    def fetch_nearby_stations(self, force=True): return self.auth.fetch_nearby_stations(force=force)
 
     def _update_vehicle_name(self, candidate_name):
         if not candidate_name: return
@@ -140,15 +142,6 @@ class VinFastAPI:
         class MockMsg:
             def __init__(self, data): self.payload = json.dumps(data).encode('utf-8')
         self.mqtt._on_message(None, None, MockMsg(payload_list))
-
-    def _process_console_command(self, cmd):
-        parts = cmd.lower().split()
-        if not parts: return
-        action = parts[0]
-        if action == "cs": self.inject_mock_data([{"deviceKey": "34193_00001_00005", "value": "1"}, {"deviceKey": "34183_00000_00001", "value": "1"}])
-        elif action == "rs": self.inject_mock_data([{"deviceKey": "34193_00001_00005", "value": "2"}, {"deviceKey": "34183_00000_00001", "value": "2"}])
-        elif action == "soc" and len(parts) > 1: self.inject_mock_data([{"deviceKey": "34183_00001_00009", "value": parts[1]}, {"deviceKey": "34180_00001_00011", "value": parts[1]}])
-        elif action == "ai": threading.Thread(target=self.mqtt._run_ai_advisor_wrapper, args=("trip", {"dist": 15.5, "drop": 6.0}), daemon=True).start()
 
     def _calculate_advanced_stats(self):
         try:
@@ -190,12 +183,15 @@ class VinFastAPI:
             batt_pct = safe_float(self._last_data.get("34183_00001_00009", self._last_data.get("34180_00001_00011", 0)))
             calc_max = safe_float(self._last_data.get("api_calc_max_range", 0))
             
-            if calc_max > 0:
-                self._last_data["api_calc_range_per_percent"] = round(calc_max / 100.0, 2)
-                if batt_pct > 0: self._last_data["api_calc_remain_range"] = round(calc_max * (batt_pct / 100.0), 1)
-            elif ran > 0:
-                self._last_data["api_calc_range_per_percent"] = round(ran / 100.0, 2)
-                if batt_pct > 0: self._last_data["api_calc_remain_range"] = round(ran * (batt_pct / 100.0), 1)
+            if safe_float(self._last_data.get("api_calc_range_per_percent", 0)) == 0.0:
+                if calc_max > 0:
+                    self._last_data["api_calc_range_per_percent"] = round(calc_max / 100.0, 2)
+                elif ran > 0:
+                    self._last_data["api_calc_range_per_percent"] = round(ran / 100.0, 2)
+
+            rpp = safe_float(self._last_data.get("api_calc_range_per_percent", 0))
+            if rpp > 0 and batt_pct > 0:
+                self._last_data["api_calc_remain_range"] = round(rpp * batt_pct, 1)
 
             cost_per_kwh = safe_float(self.options.get("cost_per_kwh", 4000))
             gas_price = safe_float(self.options.get("gas_price", 20000))
@@ -210,9 +206,6 @@ class VinFastAPI:
 
         except Exception: pass
 
-    # =================================================================================
-    # THUẬT TOÁN NẮN ĐƯỜNG NGẦM (HỖ TRỢ CẢ FILE CHÍNH VÀ FILE ARCHIVE)
-    # =================================================================================
     async def async_smooth_trip_background(self, trip_id, raw_route, target_trip_file=None):
         if not raw_route or len(raw_route) < 3: return
 
@@ -222,7 +215,6 @@ class VinFastAPI:
         _LOGGER.warning(f"VinFast: [TRIP {trip_id}] Bắt đầu đẩy {len(raw_route)} tọa độ lên lưới AI Map Matching...")
         smoothed_route = await async_process_route(self.hass, raw_route, mapbox_token, stadia_token)
 
-        # Nếu không truyền file cụ thể, mặc định lưu vào file chính
         trip_file = target_trip_file if target_trip_file else os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
         try:
             def update_json_file():
@@ -241,7 +233,6 @@ class VinFastAPI:
                     with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips, f, ensure_ascii=False)
                 return updated
 
-            _LOGGER.warning(f"VinFast: [TRIP {trip_id}] Đã nắn xong! Đang ghi lại vào {os.path.basename(trip_file)}...")
             updated = await self.hass.async_add_executor_job(update_json_file)
             
             if updated:
@@ -249,18 +240,13 @@ class VinFastAPI:
                 if getattr(self, '_last_data', {}).get("api_trip_route") and "archive" not in trip_file:
                     self._last_data["api_trip_route"] = json.dumps(smoothed_route)
                     self.trigger_callbacks()
-            else:
-                _LOGGER.error(f"VinFast: [TRIP {trip_id}] Không tìm thấy ID trong file JSON để cập nhật.")
                     
         except Exception as e:
             _LOGGER.error(f"VinFast: Lỗi khi ghi Cache nắn đường: {e}")
 
     async def async_fix_all_historical_trips(self, force=False):
-        """Quét và nắn đường cho cả File Trip Chính và File Archive (Lưu trữ tháng)"""
         vin_str = self.vin.lower()
         now = datetime.datetime.now()
-        
-        # Tạo danh sách các file cần quét (File chính, file tháng này, file tháng trước)
         prev_month = now.replace(day=1) - datetime.timedelta(days=1)
         files_to_check = [
             os.path.join(WWW_DIR, f"vinfast_trips_{vin_str}.json"),
@@ -271,7 +257,6 @@ class VinFastAPI:
         total_fixed = 0
         for trip_file in files_to_check:
             if not os.path.exists(trip_file): continue
-
             try:
                 def read_trips():
                     with open(trip_file, 'r', encoding='utf-8') as f: return json.load(f)
@@ -282,13 +267,8 @@ class VinFastAPI:
                 for i, trip in enumerate(trips):
                     is_recent = (i < 5)
                     is_archived = "archive" in trip_file
-                    
-                    # Ưu tiên sửa chuyến chưa smooth. Nếu force=True thì chỉ ép nắn lại 5 chuyến gần nhất của file chính
                     if not trip.get("is_smoothed", False) or (force and is_recent and not is_archived):
                         pending_trips.append(trip)
-
-                if pending_trips:
-                    _LOGGER.warning(f"VinFast: Quét thấy {len(pending_trips)} chuyến đi cần nắn thẳng trong file {os.path.basename(trip_file)}")
 
                 for trip in pending_trips:
                     raw_route = trip.get("route", [])
@@ -301,12 +281,9 @@ class VinFastAPI:
                         def save_trip_ignore():
                             with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips, f, ensure_ascii=False)
                         await self.hass.async_add_executor_job(save_trip_ignore)
-            except Exception as e:
-                _LOGGER.error(f"VinFast: Lỗi khi đọc file {os.path.basename(trip_file)}: {e}")
+            except Exception as e: pass
                 
-        if total_fixed == 0:
-            _LOGGER.warning("VinFast: Bản đồ đã được tối ưu toàn bộ. Không có chuyến đi nào cần nắn thêm.")
-        else:
+        if total_fixed > 0:
             _LOGGER.warning(f"VinFast: HOÀN TẤT NẮN {total_fixed} CHUYẾN ĐI (Bao gồm cả Archive)!")
 
     def _load_state(self):
@@ -330,10 +307,12 @@ class VinFastAPI:
                         self._trip_start_time = mem.get("trip_start_time", time.time())
                         self._trip_start_soc = mem.get("trip_start_soc", 100.0)
                         self._trip_accumulated_distance_m = mem.get("trip_accumulated_distance_m", 0.0) 
-                        self._eff_soc = mem.get("eff_soc", None)
+                        
+                        self._eff_initial_soc = mem.get("eff_initial_soc", None)
+                        self._eff_start_soc = mem.get("eff_start_soc", None)
                         self._eff_gps_dist = mem.get("eff_gps_dist", 0.0)
-                        self._eff_time = mem.get("eff_time", None)
-                        self._eff_stats = mem.get("eff_stats", {})
+                        self._eff_ignored_first = mem.get("eff_ignored_first", False)
+                        
                         self._charge_start_soc = mem.get("charge_start_soc", 0.0)
                         self._charge_calc_soc = mem.get("charge_calc_soc", 0.0)
                         self._charge_start_time = mem.get("charge_start_time", time.time())
@@ -369,10 +348,12 @@ class VinFastAPI:
                     "trip_start_time": getattr(self, '_trip_start_time', time.time()),
                     "trip_start_soc": getattr(self, '_trip_start_soc', 100.0),
                     "trip_accumulated_distance_m": getattr(self, '_trip_accumulated_distance_m', 0.0), 
-                    "eff_soc": getattr(self, '_eff_soc', None),
+                    
+                    "eff_initial_soc": getattr(self, '_eff_initial_soc', None),
+                    "eff_start_soc": getattr(self, '_eff_start_soc', None),
                     "eff_gps_dist": getattr(self, '_eff_gps_dist', 0.0),
-                    "eff_time": getattr(self, '_eff_time', None),
-                    "eff_stats": getattr(self, '_eff_stats', {}),
+                    "eff_ignored_first": getattr(self, '_eff_ignored_first', False),
+                    
                     "charge_start_soc": getattr(self, '_charge_start_soc', 0.0),
                     "charge_calc_soc": getattr(self, '_charge_calc_soc', 0.0),
                     "charge_start_time": getattr(self, '_charge_start_time', time.time()),
@@ -400,8 +381,6 @@ class VinFastAPI:
         try:
             import datetime
             os.makedirs(WWW_DIR, exist_ok=True)
-            # Việc ghi file archive sẽ do script bên ngoài xử lý, 
-            # API chỉ cần ghi vào file chính như bình thường.
             trip_file = os.path.join(WWW_DIR, f"vinfast_trips_{self.vin.lower()}.json")
             trips = []
             if os.path.exists(trip_file):
@@ -429,7 +408,6 @@ class VinFastAPI:
                     "is_smoothed": False 
                 }
                 trips.insert(0, new_trip) 
-                # Giới hạn giữ lại 50 chuyến ở file chính để tránh quá tải
                 with open(trip_file, 'w', encoding='utf-8') as f: json.dump(trips[:50], f, ensure_ascii=False)
 
                 if hasattr(self, 'hass') and self.hass:

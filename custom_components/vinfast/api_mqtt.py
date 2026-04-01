@@ -115,12 +115,12 @@ class MQTTManager:
                     if time_since_last_wakeup > 180:
                         core.auth.register_resources() 
 
-                # =======================================================
-                # ĐỊNH KỲ QUÉT TRẠM SẠC LÂN CẬN (15 PHÚT MỘT LẦN)
-                # =======================================================
+                # =======================================================================
+                # ĐÃ TÁCH KHỎI IF IS_MOVING: CẬP NHẬT TRẠM SẠC ĐỊNH KỲ MỖI 15 PHÚT
+                # =======================================================================
                 if now - getattr(self, '_last_periodic_station_fetch', 0) >= 900:
                     self._last_periodic_station_fetch = now
-                    threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": False}, daemon=True).start()
+                    threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": True}, daemon=True).start()
 
                 time_since_move = now - getattr(core, '_last_actual_move_time', now)
                 if getattr(core, '_is_trip_active', False) and not getattr(core, '_is_moving', False) and time_since_move >= 300:
@@ -186,8 +186,7 @@ class MQTTManager:
                     if addr:
                         core._last_data["api_current_address"] = addr
                         core._last_geocoded_grid = grid_coord 
-                        # Khi xe sang vùng địa lý mới (có địa chỉ mới), LẬP TỨC quét lại trạm sạc xung quanh
-                        threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": True}, daemon=True).start()
+                        threading.Thread(target=core.auth.fetch_nearby_stations, kwargs={"force": False}, daemon=True).start()
                     else:
                         core._last_data["api_current_address"] = f"Lat/Lon: {lat:.5f}, {lon:.5f}"
                     core._save_state()
@@ -330,6 +329,7 @@ class MQTTManager:
                 core._last_data["api_trip_efficiency"] = 0.0
                 core._trip_accumulated_distance_m = 0.0 
                 core._route_coords = [] 
+                
                 core._save_state()
         except Exception: pass
 
@@ -341,6 +341,10 @@ class MQTTManager:
                 curr_coord = f"{lat},{lon}"
                 if curr_coord != getattr(core, '_last_lat_lon', ""): 
                     core._last_lat_lon = curr_coord
+                    # BẮT BUỘC LƯU LẠI VỊ TRÍ ĐỂ TRẠM SẠC LUÔN CÓ TỌA ĐỘ NGAY CẢ KHI RESTART
+                    core._last_data["api_last_lat"] = lat
+                    core._last_data["api_last_lon"] = lon
+                    
                     threading.Thread(target=self._update_location_async, args=(lat, lon), daemon=True).start()
                     
                     if getattr(core, '_is_trip_active', False):
@@ -369,7 +373,9 @@ class MQTTManager:
 
                             if is_valid_point and distance_m > 0:
                                 core._trip_accumulated_distance_m += distance_m
-                                core._eff_gps_dist += distance_m
+                                
+                                core._eff_gps_dist = getattr(core, '_eff_gps_dist', 0.0) + distance_m
+                                
                                 core._route_coords.append([round(lat, 6), round(lon, 6), int(actual_speed_kmh)])
                                 core._last_gps_time = current_time
                                 
@@ -402,50 +408,38 @@ class MQTTManager:
         except Exception: pass
 
         if current_soc > 0:
-            if getattr(core, '_eff_soc', None) is None or current_soc > core._eff_soc:
-                core._eff_soc = current_soc
+            if getattr(core, '_eff_initial_soc', None) is None or current_soc > core._eff_initial_soc:
+                core._eff_initial_soc = current_soc
+                core._eff_start_soc = current_soc
                 core._eff_gps_dist = 0.0
-                core._eff_time = current_time 
-                core._eff_speeds = []
-            
-            if speed > 0: core._eff_speeds.append(speed)
+                core._eff_ignored_first = False
                 
-            if current_soc < core._eff_soc:
-                drop_amount = core._eff_soc - current_soc
-                dist_km = getattr(core, '_eff_gps_dist', 0.0) / 1000.0
-                if dist_km > 0:
-                    sorted_speeds = sorted(core._eff_speeds)
-                    median_speed = sorted_speeds[len(sorted_speeds) // 2] if sorted_speeds else speed
-                    band_lower = int(median_speed / 10) * 10
-                    band_key = f"{band_lower}-{band_lower+10}"
-                    
-                    if band_key not in core._eff_stats: core._eff_stats[band_key] = {"dist": 0.0, "drops": 0.0}
-                    core._eff_stats[band_key]["dist"] += dist_km
-                    core._eff_stats[band_key]["drops"] += drop_amount
-                    
-                    best_b, max_e = "Đang thu thập", 0
-                    for k, v in core._eff_stats.items():
-                        if v["drops"] > 0:
-                            eff = v["dist"] / v["drops"]
-                            if eff > max_e: max_e, best_b = eff, k
-                    if max_e > 0: core._last_data["api_best_efficiency_band"] = f"{best_b} km/h ({round(max_e, 2)} km/1%)"
-
-                    max_range = safe_float(core._last_data.get("api_static_range", 0))
-                    if max_range > 0 and drop_amount >= 1.0:
-                        expected_dist_per_1 = max_range / 100.0
-                        if dist_km < (expected_dist_per_1 * 0.70):
-                            now = time.time()
-                            if now - getattr(core, '_last_ai_anomaly_time', 0) > 900:
-                                core._last_ai_anomaly_time = now
-                                start_t = getattr(core, '_eff_time', None) or (now - 60)
-                                time_taken_hrs = (now - start_t) / 3600.0
-                                actual_spd = dist_km / time_taken_hrs if time_taken_hrs > 0 else median_speed
-                                threading.Thread(target=self._run_ai_advisor_wrapper, args=("anomaly", {"dist": dist_km, "drop": drop_amount, "expected": expected_dist_per_1, "speed": actual_spd}), daemon=True).start()
-                
-                core._eff_soc = current_soc
-                core._eff_gps_dist = 0.0
-                core._eff_time = current_time
-                core._eff_speeds = []
+            if current_soc < getattr(core, '_eff_start_soc', current_soc):
+                if not getattr(core, '_eff_ignored_first', False):
+                    if core._eff_initial_soc - current_soc >= 1.0:
+                        core._eff_ignored_first = True
+                        core._eff_start_soc = current_soc
+                        core._eff_gps_dist = 0.0 
+                else:
+                    drop = core._eff_start_soc - current_soc
+                    if drop >= 1.0:
+                        dist_km = getattr(core, '_eff_gps_dist', 0.0) / 1000.0
+                        if dist_km > 0:
+                            eff = dist_km / drop
+                            core._last_data["api_calc_range_per_percent"] = round(eff, 2)
+                            
+                            std_range = safe_float(core._last_data.get("api_static_range", 210))
+                            expected_km_per_1 = std_range / 100.0 if std_range > 0 else 2.1
+                            
+                            if eff < (expected_km_per_1 * 0.70):
+                                now = time.time()
+                                if now - getattr(core, '_last_ai_anomaly_time', 0) > 900:
+                                    core._last_ai_anomaly_time = now
+                                    actual_spd = float(speed)
+                                    threading.Thread(target=self._run_ai_advisor_wrapper, args=("anomaly", {"dist": dist_km, "drop": drop, "expected": expected_km_per_1, "speed": actual_spd}), daemon=True).start()
+                        
+                        core._eff_start_soc = current_soc
+                        core._eff_gps_dist = 0.0
 
         try:
             if "VF8" in model or "VF9" in model: c_status = str(core._last_data.get("34183_00000_00001", "0"))
@@ -492,6 +486,12 @@ class MQTTManager:
                 core._charge_calc_time = current_time
                 core._last_data["api_live_charge_power"] = 0.0
                 core._last_is_charging = True
+                
+                core._eff_initial_soc = current_soc
+                core._eff_start_soc = current_soc
+                core._eff_gps_dist = 0.0
+                core._eff_ignored_first = False
+                
                 core._save_state() 
                 
             elif core._is_charging and getattr(core, '_last_is_charging', False):

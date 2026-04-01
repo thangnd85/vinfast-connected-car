@@ -109,7 +109,7 @@ class AuthManager:
         return base64.b64encode(hmac.new(hash2_key.encode('utf-8'), "_".join(parts).lower().encode('utf-8'), hashlib.sha256).digest()).decode('utf-8')
 
     def _post_api(self, path, payload, max_retries=1, vin_override=None):
-        for _ in range(max_retries + 1):
+        for attempt in range(max_retries + 1):
             ts = int(time.time() * 1000)
             request_vin = vin_override or self.core.vin
             headers = self._get_base_headers(request_vin)
@@ -120,11 +120,15 @@ class AuthManager:
             })
             try:
                 res = requests.post(f"{self.core.api_base}/{path}", headers=headers, json=payload, timeout=15)
-                if res.status_code == 401:
+                # CHÌA KHÓA: Nếu API trả về 401 hoặc 403 (Hết hạn Token), tự động Login lấy Token mới và gọi lại
+                if res.status_code in [401, 403]:
+                    _LOGGER.warning(f"VinFast: Token hết hạn (Lỗi {res.status_code}), đang xin cấp lại Token...")
                     self.login() 
                     continue
                 return res
-            except Exception: return None
+            except Exception as e:
+                _LOGGER.error(f"VinFast: Lỗi kết nối API POST - {e}")
+                time.sleep(2)
         return None
 
     def register_device_trust(self):
@@ -213,6 +217,11 @@ class AuthManager:
                 "X-TIMESTAMP": str(ts)
             })
             res = requests.get(f"{self.core.api_base}/{api_path}", headers=headers, timeout=10)
+            if res and res.status_code == 401:
+                self.login()
+                headers["Authorization"] = f"Bearer {self.core.access_token}"
+                res = requests.get(f"{self.core.api_base}/{api_path}", headers=headers, timeout=10)
+                
             if res and res.status_code == 200:
                 data = res.json().get("data")
                 if data:
@@ -226,30 +235,22 @@ class AuthManager:
         except Exception: pass
         return False
 
-    def fetch_nearby_stations(self, force=False):
-        """Tải danh sách trạm sạc lân cận với bán kính động"""
+    def fetch_nearby_stations(self, force=True):
         try:
             now = time.time()
-            # Chống spam API (Nếu không bị force, giới hạn gọi 60s/lần)
             if not force and now - getattr(self.core, '_last_station_fetch_time', 0) < 60:
                 return
 
-            if not self.core._last_lat_lon: return
-            lat_str, lon_str = self.core._last_lat_lon.split(',')
+            # XỬ LÝ LỖI KHỞI ĐỘNG KHI XE ĐANG NGỦ (Không có MQTT): Lấy vị trí từ bộ nhớ đệm
+            lat_str = getattr(self.core, '_last_lat_lon', "").split(',')[0] if getattr(self.core, '_last_lat_lon', "") else self.core._last_data.get("api_last_lat")
+            lon_str = getattr(self.core, '_last_lat_lon', "").split(',')[1] if getattr(self.core, '_last_lat_lon', "") else self.core._last_data.get("api_last_lon")
             
-            # LOGIC BÁN KÍNH ĐỘNG: Lấy quãng đường còn lại làm chuẩn
+            if not lat_str or not lon_str: 
+                _LOGGER.warning("VinFast: Chưa xác định được tọa độ, không thể tìm trạm sạc.")
+                return
+            
             remain_range = safe_float(self.core._last_data.get("api_calc_remain_range", self.core._last_data.get("34180_00001_00007", 50)))
-            
-            # Đổi sang mét. Bán kính nhỏ nhất là 10km, lớn nhất là 100km
             search_radius = int(min(max(remain_range * 1000, 10000), 100000))
-            
-            ts = int(time.time() * 1000)
-            headers = self._get_base_headers()
-            headers.update({
-                "X-HASH": self._generate_x_hash("POST", "ccarcharging/api/v1/stations/search", self.core.vin, ts), 
-                "X-HASH-2": self._generate_x_hash_2("android", self.core.vin, DEVICE_ID, "ccarcharging/api/v1/stations/search", "POST", ts), 
-                "X-TIMESTAMP": str(ts)
-            })
             
             payload = {
                 "latitude": float(lat_str), 
@@ -258,7 +259,9 @@ class AuthManager:
                 "excludeFavorite": False, "stationType": [], "status": [], "brandIds": []
             }
             
-            res = requests.post(f"{self.core.api_base}/ccarcharging/api/v1/stations/search?page=0&size=50", headers=headers, json=payload, timeout=15)
+            # SỬ DỤNG _POST_API CHỐNG LỖI TOKEN
+            res = self._post_api("ccarcharging/api/v1/stations/search?page=0&size=50", payload)
+            
             if res and res.status_code == 200:
                 self.core._last_station_fetch_time = now
                 data = res.json().get("data", [])
@@ -270,7 +273,6 @@ class AuthManager:
                     if not st_lat or not st_lng: continue
                     dist = round(safe_float(st.get("distance", 0))/1000, 1)
                     
-                    # Bỏ qua các trạm bị API trả thừa ngoài bán kính quét + biên độ 2km
                     if dist > (search_radius / 1000) + 2.0: continue 
                     
                     max_power, avail, total = 0, 0, 0
@@ -283,8 +285,10 @@ class AuthManager:
                 
                 stations = sorted(stations, key=lambda x: x["dist"])
                 self.core._last_data["api_nearby_stations"] = json.dumps(stations)
+                _LOGGER.warning(f"VinFast: Đã tải thành công {len(stations)} trạm sạc lân cận (Bán kính {search_radius/1000}km)")
                 self.core.trigger_callbacks()
-        except Exception: pass
+        except Exception as e: 
+            _LOGGER.error(f"VinFast: Lỗi tải trạm sạc - {e}")
 
     def fetch_charging_history(self):
         max_retries = 5 
@@ -298,13 +302,6 @@ class AuthManager:
                     
                 api_path = "ccarcharging/api/v1/charging-sessions/search"
                 ts = int(time.time() * 1000)
-                headers = self._get_base_headers()
-                headers.update({
-                    "X-HASH": self._generate_x_hash("POST", api_path, self.core.vin, ts), 
-                    "X-HASH-2": self._generate_x_hash_2("android", self.core.vin, DEVICE_ID, api_path, "POST", ts), 
-                    "X-TIMESTAMP": str(ts)
-                })
-                
                 payload = {"orderStatus": [3, 5, 7], "startTime": 1704067200000, "endTime": ts}
                 
                 all_sessions = []
@@ -313,7 +310,8 @@ class AuthManager:
                 success_fetch = False
                 
                 while page < 50: 
-                    res = requests.post(f"{self.core.api_base}/{api_path}?page={page}&size={size}", headers=headers, json=payload, timeout=20)
+                    # SỬ DỤNG _POST_API CHỐNG LỖI TOKEN
+                    res = self._post_api(f"{api_path}?page={page}&size={size}", payload)
                     if res and res.status_code == 200:
                         data = res.json().get("data", {})
                         content = data.get("content", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
